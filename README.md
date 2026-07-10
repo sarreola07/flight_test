@@ -51,6 +51,8 @@ python check_pixhawk.py --device /dev/ttyTHS1 --baud 921600   # via TELEM2 UART
 python check_pixhawk.py --timeout 20                          # slower heartbeat wait
 ```
 
+![check_pixhawk.py output](docs/check_pixhawk.png)
+
 ## What the script checks
 
 1. **Serial port opens** — cable present, permissions OK.
@@ -105,6 +107,16 @@ Safety interlocks: motor tests are locked out while props are on, and flight is
 locked out while props are off. Ctrl-C sends a disarm in missions 1–3; in
 mission 4 it only stops the monitor — the RC pilot keeps control and disarms
 with the sticks (throttle low + yaw left).
+
+The mission menu with props off, and the interlock refusing a flight mission
+without props:
+
+![missions menu](docs/missions_menu.png)
+![safety interlock](docs/safety_lockout.png)
+
+Mission 4 verifying the RC link before flight (aborted at the FLY prompt):
+
+![mission 4 RC check](docs/mission4_rc_check.png)
 
 Notes for this vehicle (PX4 v1.13.3, FMUv2):
 
