@@ -154,6 +154,14 @@ def mission_3(master):
         print(f"{INFO} Aborted.")
         return
 
+    # AUTO.TAKEOFF needs a position estimate (GPS/optical flow); check before arming
+    print(f"{INFO} Checking position estimate ...")
+    if master.recv_match(type="LOCAL_POSITION_NED", blocking=True, timeout=3) is None:
+        print(f"{FAIL} No position estimate — PX4 cannot do an automatic takeoff.")
+        print(f"{WARN} This vehicle has no GPS/optical flow. Fit a GPS module and go")
+        print(f"{WARN} outdoors, or fly manually with the RC transmitter instead.")
+        return
+
     # Takeoff altitude used by PX4's AUTO.TAKEOFF mode
     master.mav.param_set_send(
         master.target_system, master.target_component,
