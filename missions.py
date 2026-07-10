@@ -53,18 +53,33 @@ def drain_statustext(master, seconds=0.5):
 
 
 def send_command(master, command, *params, name=""):
-    """Send a COMMAND_LONG and wait for its ACK. Returns True on MAV_RESULT_ACCEPTED."""
+    """Send a COMMAND_LONG and wait for its ACK. Returns True on MAV_RESULT_ACCEPTED.
+
+    STATUSTEXT messages arriving alongside the ACK carry the FC's reason for a
+    rejection (e.g. "Arming denied! ..."), so collect and print them too.
+    """
     p = list(params) + [0] * (7 - len(params))
     master.mav.command_long_send(
         master.target_system, master.target_component, command, 0, *p)
-    ack = master.recv_match(type="COMMAND_ACK", blocking=True, timeout=3)
+    ack = None
+    end = time.time() + 3
+    while time.time() < end:
+        msg = master.recv_match(type=["COMMAND_ACK", "STATUSTEXT"],
+                                blocking=True, timeout=0.5)
+        if msg is None:
+            continue
+        if msg.get_type() == "STATUSTEXT":
+            print(f"{INFO}   FC says: {msg.text}")
+        elif msg.command == command:
+            ack = msg
+            break
     if ack is None:
         print(f"{FAIL} {name}: no acknowledgement")
         return False
     if ack.result != mavutil.mavlink.MAV_RESULT_ACCEPTED:
         result = mavutil.mavlink.enums["MAV_RESULT"][ack.result].name
         print(f"{FAIL} {name}: rejected ({result})")
-        drain_statustext(master, 1.0)
+        drain_statustext(master, 3.0)
         return False
     return True
 
@@ -135,7 +150,7 @@ def wait_altitude(master, target_m, timeout=30):
 def mission_3(master):
     print(f"\n{INFO} Mission 3: arm → take off to {TAKEOFF_ALT_M:.2f} m (3 ft) → land → disarm.")
     print(f"{WARN} THIS FLIES THE DRONE. Clear the area. Be ready to cut power.")
-    if input("Type FLY to continue, anything else to abort: ").strip() != "FLY":
+    if input("Type FLY to continue, anything else to abort: ").strip().lower() != "fly":
         print(f"{INFO} Aborted.")
         return
 
@@ -149,8 +164,8 @@ def mission_3(master):
     if not send_command(master, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1,
                         name="arm"):
         print(f"{WARN} PX4 refused to arm — its preflight checks decide, not us.")
-        print(f"{WARN} Common causes: no position estimate (no GPS), safety switch,")
-        print(f"{WARN} no airframe selected (SYS_AUTOSTART=0), sensors not calibrated.")
+        print(f"{WARN} The 'FC says' line above is the exact reason. Common causes:")
+        print(f"{WARN} no RC/joystick input, no position estimate, sensors not calibrated.")
         return
     print(f"{PASS} Armed.")
 

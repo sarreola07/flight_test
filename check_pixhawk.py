@@ -123,7 +123,14 @@ def main():
         master.target_system, master.target_component, b"SYS_AUTOSTART", -1)
     p = master.recv_match(type="PARAM_VALUE", blocking=True, timeout=5)
     if p:
-        print(f"{PASS} Parameter read: {p.param_id} = {int(p.param_value)}")
+        # PX4 packs integer params byte-wise into the float field
+        if p.param_type in (mavutil.mavlink.MAV_PARAM_TYPE_INT32,
+                            mavutil.mavlink.MAV_PARAM_TYPE_UINT32):
+            import struct
+            value = struct.unpack("<i", struct.pack("<f", p.param_value))[0]
+        else:
+            value = p.param_value
+        print(f"{PASS} Parameter read: {p.param_id} = {value}")
         results.append(("Parameter read (two-way link)", True))
     else:
         print(f"{FAIL} Parameter read failed")

@@ -107,10 +107,15 @@ Notes for this vehicle (PX4 v1.13.3, FMUv2):
 
 - Motor tests use `MAV_CMD_DO_MOTOR_TEST`; the safety switch must be pressed
   (solid LED) and a battery connected, or the FC rejects the command.
-- Mission 3 uses PX4's AUTO.TAKEOFF/AUTO.LAND modes. PX4's own preflight checks
-  must pass before it will arm: it needs a position/altitude estimate (GPS or
-  optical flow) and an airframe selected. **`SYS_AUTOSTART` is currently 0 (no
-  airframe configured), so PX4 will refuse to arm until that is set.**
+- Mission 3 uses PX4's AUTO.TAKEOFF/AUTO.LAND modes. PX4's own preflight and
+  arm-time checks must pass before it will arm; when it refuses, the script
+  prints the FC's exact reason ("FC says: ...").
+- This vehicle is configured as airframe `SYS_AUTOSTART=6001` (DJI F550
+  hexarotor), safety switch bypassed (`CBRK_IO_SAFETY=22027`), arming without
+  GPS allowed (`COM_ARM_WO_GPS=1`).
+- FMUv2 quirk: PX4 v1.13 on this board doesn't run `load_mon`, so the
+  "No CPU load information" preflight check fails out of the box. We set
+  `COM_CPU_MAX=-1` to disable that check.
 
 ## Next steps
 
