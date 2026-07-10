@@ -84,6 +84,34 @@ All good: the Jetson can talk to the Pixhawk. ✅
 - **No heartbeat** — wait ~30 s after plugging in for PX4 to boot; make sure
   nothing else (e.g. MAVProxy) already has the port open.
 
+## Missions (missions.py)
+
+Interactive bench-test program:
+
+```bash
+./venv/bin/python missions.py
+```
+
+It first asks whether the propellers are removed, then offers:
+
+| Mission | What it does | Requires |
+|---|---|---|
+| 1 | Spins each motor one at a time, 3 s each at 15% throttle | Props **OFF** |
+| 2 | Spins all motors together for 3 s at 15% throttle | Props **OFF** |
+| 3 | Arms, takes off to 3 ft (0.91 m), hovers, lands, disarms | Props **ON**, extra `FLY` confirmation |
+
+Safety interlocks: motor tests are locked out while props are on, and flight is
+locked out while props are off. Ctrl-C at any point sends a disarm.
+
+Notes for this vehicle (PX4 v1.13.3, FMUv2):
+
+- Motor tests use `MAV_CMD_DO_MOTOR_TEST`; the safety switch must be pressed
+  (solid LED) and a battery connected, or the FC rejects the command.
+- Mission 3 uses PX4's AUTO.TAKEOFF/AUTO.LAND modes. PX4's own preflight checks
+  must pass before it will arm: it needs a position/altitude estimate (GPS or
+  optical flow) and an airframe selected. **`SYS_AUTOSTART` is currently 0 (no
+  airframe configured), so PX4 will refuse to arm until that is set.**
+
 ## Next steps
 
 - MAVProxy (`pip install MAVProxy` in the venv) for an interactive shell / to
