@@ -52,7 +52,11 @@ def main():
         sys.exit(1)
     results.append(("Serial port opened", True))
 
-    # 2. Wait for a heartbeat
+    # 2. Announce ourselves, then wait for a heartbeat.
+    # PX4 v1.13+ keeps the USB port silent until it detects MAVLink traffic
+    # from the host, so we must send a GCS heartbeat first.
+    master.mav.heartbeat_send(
+        mavutil.mavlink.MAV_TYPE_GCS, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
     hb = master.wait_heartbeat(timeout=args.timeout)
     if hb is None:
         print(f"{FAIL} No heartbeat within {args.timeout}s. Check cable/power and device path.")
