@@ -6,6 +6,8 @@ Missions:
   1) Spin each motor one at a time for 3 s (props MUST be off)
   2) Spin all motors together for 3 s   (props MUST be off)
   3) Arm, take off to 3 ft, land, disarm (props on — REAL FLIGHT)
+  4) RC manual flight: Stabilized mode, arm, you fly with the
+     transmitter while this script monitors (props on — REAL FLIGHT)
 
 Usage:
     ./venv/bin/python missions.py
@@ -199,6 +201,73 @@ def mission_3(master):
     send_command(master, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, name="disarm")
 
 
+def rc_link_ok(master):
+    """True when the RC receiver is enabled and healthy (transmitter bound, no failsafe)."""
+    s = master.recv_match(type="SYS_STATUS", blocking=True, timeout=5)
+    if s is None:
+        return False
+    bit = mavutil.mavlink.MAV_SYS_STATUS_SENSOR_RC_RECEIVER
+    return bool(s.onboard_control_sensors_enabled & bit
+                and s.onboard_control_sensors_health & bit)
+
+
+def mission_4(master):
+    print(f"\n{INFO} Mission 4: manual RC flight in Stabilized mode.")
+    print(f"{INFO} You fly with the transmitter; this script arms, then only watches.")
+    print(f"{WARN} THIS FLIES THE DRONE. Clear the area. Be ready to cut power.")
+
+    print(f"{INFO} Checking RC link ...")
+    if not rc_link_ok(master):
+        print(f"{FAIL} RC link is down (transmitter off, unbound, or in failsafe).")
+        print(f"{WARN} Turn the transmitter on and re-run.")
+        return
+    print(f"{PASS} RC link is up.")
+
+    if input("Type FLY to continue, anything else to abort: ").strip().lower() != "fly":
+        print(f"{INFO} Aborted.")
+        return
+
+    print(f"{INFO} Switching to STABILIZED ...")
+    master.set_mode_px4(*mavutil.px4_map["STABILIZED"])
+    time.sleep(1)
+
+    print(f"{INFO} Arming (keep throttle LOW) ...")
+    if not send_command(master, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1,
+                        name="arm"):
+        print(f"{WARN} PX4 refused to arm — see the 'FC says' line above.")
+        return
+    print(f"{PASS} Armed. Motors at idle — you have the controls.")
+    print(f"{INFO} Monitoring until you land and disarm (throttle low + yaw left,")
+    print(f"{INFO} or let PX4 auto-disarm after landing). Ctrl-C stops ONLY the")
+    print(f"{INFO} monitor — it will NOT disarm the drone.\n")
+
+    try:
+        last_beat = 0.0
+        while True:
+            now = time.time()
+            if now - last_beat > 1.0:
+                master.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
+                                          mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+                last_beat = now
+            msg = master.recv_match(type=["HEARTBEAT", "VFR_HUD", "SYS_STATUS", "STATUSTEXT"],
+                                    blocking=True, timeout=2)
+            if msg is None:
+                continue
+            t = msg.get_type()
+            if t == "STATUSTEXT":
+                print(f"\n{INFO} FC says: {msg.text}")
+            elif t == "HEARTBEAT":
+                if not (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
+                    print(f"\n{PASS} Disarmed — mission 4 complete.")
+                    return
+            elif t == "VFR_HUD":
+                print(f"\r{INFO} alt {msg.alt:7.1f} m  climb {msg.climb:+5.1f} m/s  "
+                      f"throttle {msg.throttle:3d}%   ", end="", flush=True)
+    except KeyboardInterrupt:
+        print(f"\n{WARN} Monitor stopped. Drone may still be ARMED — you have the RC.")
+        print(f"{WARN} Land and disarm with the transmitter (throttle low + yaw left).")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Pixhawk bench-test missions")
     parser.add_argument("--device", default="/dev/ttyACM0")
@@ -219,16 +288,17 @@ def main():
             props_off = False
 
     if props_off:
-        print(f"\n{PASS} Props off — motor tests available. Flight (3) is locked out.")
+        print(f"\n{PASS} Props off — motor tests available. Flight (3, 4) is locked out.")
         allowed = {"1", "2"}
     else:
         print(f"\n{WARN} Props ON — motor tests are locked out for safety.")
-        print(f"{WARN} Only mission 3 (flight) is available.")
-        allowed = {"3"}
+        print(f"{WARN} Only flight missions (3, 4) are available.")
+        allowed = {"3", "4"}
 
     print("\n  1) Test each motor for 3 s, one at a time")
     print("  2) Test all motors at the same time")
-    print("  3) Arm, take off 3 ft, land, shut off")
+    print("  3) Arm, take off 3 ft, land, shut off (automatic — needs GPS)")
+    print("  4) Manual RC flight in Stabilized mode (script arms + monitors)")
     print("  q) Quit")
 
     while True:
@@ -236,13 +306,13 @@ def main():
         if choice == "q":
             print("Bye.")
             return
-        if choice in ("1", "2", "3"):
+        if choice in ("1", "2", "3", "4"):
             break
-        print("Enter 1, 2, 3 or q.")
+        print("Enter 1, 2, 3, 4 or q.")
 
     if choice not in allowed:
         if props_off:
-            sys.exit(f"{FAIL} Mission 3 needs props ON. Re-run after fitting props.")
+            sys.exit(f"{FAIL} Flight missions need props ON. Re-run after fitting props.")
         sys.exit(f"{FAIL} Motor tests need props OFF. Remove them and re-run.")
 
     master = connect(args.device, args.baud)
@@ -251,8 +321,10 @@ def main():
             mission_1(master, args.motors)
         elif choice == "2":
             mission_2(master, args.motors)
-        else:
+        elif choice == "3":
             mission_3(master)
+        else:
+            mission_4(master)
     except KeyboardInterrupt:
         print(f"\n{WARN} Interrupted — sending disarm just in case.")
         master.mav.command_long_send(

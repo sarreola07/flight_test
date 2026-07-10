@@ -98,10 +98,13 @@ It first asks whether the propellers are removed, then offers:
 |---|---|---|
 | 1 | Spins each motor one at a time, 3 s each at 15% throttle | Props **OFF** |
 | 2 | Spins all motors together for 3 s at 15% throttle | Props **OFF** |
-| 3 | Arms, takes off to 3 ft (0.91 m), hovers, lands, disarms | Props **ON**, extra `FLY` confirmation |
+| 3 | Arms, takes off to 3 ft (0.91 m), hovers, lands, disarms | Props **ON**, GPS position fix, extra `FLY` confirmation |
+| 4 | Manual RC flight: switches to Stabilized, arms, then monitors while you fly with the transmitter | Props **ON**, RC link up, extra `FLY` confirmation |
 
 Safety interlocks: motor tests are locked out while props are on, and flight is
-locked out while props are off. Ctrl-C at any point sends a disarm.
+locked out while props are off. Ctrl-C sends a disarm in missions 1–3; in
+mission 4 it only stops the monitor — the RC pilot keeps control and disarms
+with the sticks (throttle low + yaw left).
 
 Notes for this vehicle (PX4 v1.13.3, FMUv2):
 
