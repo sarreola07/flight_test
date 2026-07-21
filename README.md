@@ -102,11 +102,45 @@ It first asks whether the propellers are removed, then offers:
 | 2 | Spins all motors together for 3 s at 15% throttle | Props **OFF** |
 | 3 | Arms, takes off to 3 ft (0.91 m), hovers, lands, disarms | Props **ON**, GPS position fix, extra `FLY` confirmation |
 | 4 | Manual RC flight: switches to Stabilized, arms, then monitors while you fly with the transmitter | Props **ON**, RC link up, extra `FLY` confirmation |
+| 5 | Camera tracking display — shows the OAK-D's live person X/Y/Z. No flight. | `oak-camera` service running |
+| 6 | LoRa remote — runs missions from LoRa commands (see table below) | LoRa module on `/dev/ttyUSB0` |
 
 Safety interlocks: motor tests are locked out while props are on, and flight is
 locked out while props are off. Ctrl-C sends a disarm in missions 1–3; in
 mission 4 it only stops the monitor — the RC pilot keeps control and disarms
 with the sticks (throttle low + yaw left).
+
+### Camera + LoRa architecture
+
+Two processes talk over a local UDP socket, which keeps the camera's DepthAI
+environment separate from the flight code's venv:
+
+```
+OAK-D  --USB-->  camera_publisher.py (depthai-env)  --UDP 127.0.0.1:5005-->  missions.py (venv)
+LoRa   --/dev/ttyUSB0 serial-->                                              missions.py (pyserial)
+Pixhawk--/dev/ttyACM0 MAVLink-->                                             missions.py (pymavlink)
+```
+
+- **`camera_publisher.py`** runs the OAK-D person detector headlessly (in
+  `~/oak_drone_project/depthai-env`) and broadcasts the nearest person's
+  `{x, y, z, conf}` in metres. Started automatically on boot by `oak-camera.service`.
+- **Option 5** subscribes to that UDP stream and prints live coordinates — pure
+  telemetry, never touches the flight controller. (Autonomous *follow-flight* is
+  intentionally not wired up on this PX4 vehicle yet; see Notes.)
+- **Option 6** turns LoRa packets (`{"msg": "N"}`) into missions, under the **same
+  props interlock** you declare at startup:
+
+  | LoRa `msg` | Action | Allowed when |
+  |---|---|---|
+  | `1` | sequential motor test | props **OFF** |
+  | `2` | all-motor test | props **OFF** |
+  | `3` | camera display (30 s) | always |
+  | `4` | flight: arm / takeoff / land | props **ON** |
+
+  Because a LoRa sender can't type the `FLY` prompt, command `4` flies with **no
+  local confirmation** — it is still gated by props-ON and the Pixhawk's own
+  pre-arm checks (which currently need a GPS fix). LoRa is **not** auto-started on
+  boot; it only runs after you pick option 6.
 
 The mission menu with props off, and the interlock refusing a flight mission
 without props:
@@ -131,6 +165,39 @@ Notes for this vehicle (PX4 v1.13.3, FMUv2):
 - FMUv2 quirk: PX4 v1.13 on this board doesn't run `load_mon`, so the
   "No CPU load information" preflight check fails out of the box. We set
   `COM_CPU_MAX=-1` to disable that check.
+
+## Install: desktop icon + camera-on-boot
+
+```bash
+bash install.sh
+```
+
+This (asks for your sudo password once):
+
+1. Puts a **Hexacopter Mission** icon on the Desktop. Double-clicking it opens a
+   terminal running the mission menu (`run_missions.sh` → `missions.py`).
+2. Installs and enables **`oak-camera.service`**, which starts `camera_publisher.py`
+   on every boot so person coordinates are always flowing on UDP 5005.
+
+Check / control the camera service:
+
+```bash
+systemctl status oak-camera        # is it running?
+journalctl -u oak-camera -f        # live camera log
+sudo systemctl restart oak-camera  # restart it
+```
+
+The camera service is **camera only** — it never arms or flies the drone. Flight
+happens solely through the mission menu (or a deliberate LoRa command).
+
+## Follow-me code from classmates (`hexacopter-follow/`)
+
+The `hexacopter-follow/` folder is a separate project (a classmate's git repo) built
+for the **ArduPilot SITL simulator**, not this PX4 vehicle — its GUIDED-mode flight
+paths do not run on PX4 as-is. It is kept on disk but git-ignored by this repo. The
+only piece reused here is the camera → UDP idea, reimplemented safely in
+`camera_publisher.py`. Porting its autonomous person-following to PX4 (OFFBOARD mode
++ geofence/failsafe hardening) is future work.
 
 ## Next steps
 

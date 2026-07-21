@@ -1,3 +1,6 @@
 venv/
 __pycache__/
 *.pyc
+
+# Classmates' ArduPilot SITL project — its own git repo, kept out of this one
+hexacopter-follow/

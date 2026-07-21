@@ -1,0 +1,19 @@
+[Unit]
+Description=OAK-D person tracker -> UDP publisher (hexacopter camera)
+Documentation=https://github.com/sarreola07/flight_test
+After=multi-user.target
+# The OAK-D may enumerate a few seconds after boot; keep retrying indefinitely.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=jetson
+# Runs the DepthAI camera publisher in its own environment. It broadcasts person
+# coordinates on UDP 127.0.0.1:5005 for missions.py to read. Camera only — this
+# service never arms or flies the drone.
+ExecStart=/home/jetson/oak_drone_project/depthai-env/bin/python /home/jetson/Desktop/pixhawk-test/camera_publisher.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

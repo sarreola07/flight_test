@@ -8,6 +8,8 @@ Missions:
   3) Arm, take off to 3 ft, land, disarm (props on — REAL FLIGHT)
   4) RC manual flight: Stabilized mode, arm, you fly with the
      transmitter while this script monitors (props on — REAL FLIGHT)
+  5) Camera tracking display: show the OAK-D person X/Y/Z (no flight)
+  6) LoRa remote: run missions from LoRa commands (respects props gate)
 
 Usage:
     ./venv/bin/python missions.py
@@ -15,8 +17,12 @@ Usage:
 """
 
 import argparse
+import json
+import socket
 import sys
 import time
+
+from lora_helper import listen as listen_lora
 
 try:
     from pymavlink import mavutil
@@ -31,6 +37,14 @@ WARN = "\033[93m[WARN]\033[0m"
 TAKEOFF_ALT_M = 0.91          # 3 feet
 MOTOR_TEST_THROTTLE = 15      # percent — low, just enough to spin
 MOTOR_TEST_SECONDS = 3
+
+# Camera publisher (camera_publisher.py) broadcasts person coordinates here
+CAMERA_UDP_IP = "127.0.0.1"
+CAMERA_UDP_PORT = 5005
+
+# LoRa RX module (CP210x USB-serial)
+LORA_PORT = "/dev/ttyUSB0"
+LORA_BAUD = 115200
 
 
 def connect(device, baud, timeout=15):
@@ -149,12 +163,16 @@ def wait_altitude(master, target_m, timeout=30):
     return best
 
 
-def mission_3(master):
+def mission_3(master, require_confirm=True):
     print(f"\n{INFO} Mission 3: arm → take off to {TAKEOFF_ALT_M:.2f} m (3 ft) → land → disarm.")
     print(f"{WARN} THIS FLIES THE DRONE. Clear the area. Be ready to cut power.")
-    if input("Type FLY to continue, anything else to abort: ").strip().lower() != "fly":
-        print(f"{INFO} Aborted.")
-        return
+    if require_confirm:
+        if input("Type FLY to continue, anything else to abort: ").strip().lower() != "fly":
+            print(f"{INFO} Aborted.")
+            return
+    else:
+        print(f"{WARN} Triggered remotely by LoRa — no local confirmation. Arming in 3 s.")
+        time.sleep(3)
 
     # AUTO.TAKEOFF needs a position estimate (GPS/optical flow); check before arming
     print(f"{INFO} Checking position estimate ...")
@@ -268,6 +286,107 @@ def mission_4(master):
         print(f"{WARN} Land and disarm with the transmitter (throttle low + yaw left).")
 
 
+def listen_camera_coordinates(seconds=None):
+    """Show live person X/Y/Z from the OAK-D camera publisher (UDP). No flight.
+
+    seconds=None runs until Ctrl-C (menu option 5); a number bounds the run
+    (used by the LoRa dispatcher so it doesn't block the listener forever).
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind((CAMERA_UDP_IP, CAMERA_UDP_PORT))
+    except OSError as exc:
+        print(f"{FAIL} Cannot bind UDP {CAMERA_UDP_IP}:{CAMERA_UDP_PORT}: {exc}")
+        print(f"{WARN} Another camera listener may already be running.")
+        return
+    sock.settimeout(1.0)
+    print(f"{INFO} Listening for OAK-D coordinates on {CAMERA_UDP_IP}:{CAMERA_UDP_PORT}")
+    print(f"{INFO} Stand in view of the camera. Ctrl-C to stop." if seconds is None
+          else f"{INFO} Showing camera data for {seconds}s ...")
+
+    end = None if seconds is None else time.time() + seconds
+    last_z = None
+    warned_idle = False
+    try:
+        while end is None or time.time() < end:
+            try:
+                data, _ = sock.recvfrom(1024)
+            except socket.timeout:
+                if not warned_idle:
+                    print(f"{WARN} No detections yet — is oak-camera running, and is "
+                          f"someone in frame?")
+                    warned_idle = True
+                continue
+            try:
+                c = json.loads(data.decode())
+                x, y, z = float(c["x"]), float(c["y"]), float(c["z"])
+            except (ValueError, KeyError, json.JSONDecodeError):
+                continue
+            warned_idle = False
+            trend = ""
+            if last_z is not None:
+                if z < last_z - 0.05:
+                    trend = "  (approaching)"
+                elif z > last_z + 0.05:
+                    trend = "  (moving away)"
+            last_z = z
+            print(f"{PASS} Person X:{x:+.2f}m  Y:{y:+.2f}m  Z:{z:.2f}m{trend}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sock.close()
+    print(f"{INFO} Camera display finished.")
+
+
+def normalize_lora_msg(msg):
+    """LoRa senders sometimes deliver '1.0' for 1; coerce to the bare digit."""
+    text = str(msg).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    return text
+
+
+def handle_lora_msg(master, msg, props_off, motors):
+    """Dispatch one LoRa command under the same props interlock as the menu."""
+    msg = normalize_lora_msg(msg)
+    # command -> (label, handler, needs_props_off, needs_props_on)
+    table = {
+        "1": ("sequential motor test", lambda: mission_1(master, motors), True, False),
+        "2": ("all-motor test", lambda: mission_2(master, motors), True, False),
+        "3": ("camera display (30 s)", lambda: listen_camera_coordinates(seconds=30), False, False),
+        "4": ("flight: arm/takeoff/land", lambda: mission_3(master, require_confirm=False), False, True),
+    }
+    if msg not in table:
+        print(f"{WARN} LoRa: unknown command {msg!r} — ignored")
+        return
+    label, handler, need_off, need_on = table[msg]
+    if need_off and not props_off:
+        print(f"{FAIL} LoRa {msg} ({label}) blocked: props are ON — motor tests need props OFF.")
+        return
+    if need_on and props_off:
+        print(f"{FAIL} LoRa {msg} ({label}) blocked: props are OFF — flight needs props ON.")
+        return
+    print(f"{INFO} LoRa {msg} → {label}")
+    try:
+        handler()
+        print(f"{PASS} LoRa {msg} finished")
+    except Exception as exc:
+        print(f"{FAIL} LoRa {msg} failed: {exc}")
+
+
+def run_lora_listener(master, props_off, motors):
+    """Menu option 6: turn LoRa packets into mission commands."""
+    print(f"\n{INFO} LoRa remote listener on {LORA_PORT} @ {LORA_BAUD}.")
+    print(f"{INFO} Command map: 1=seq motors, 2=all motors, 3=camera, 4=flight.")
+    if props_off:
+        print(f"{PASS} Props OFF — LoRa may run 1, 2, 3. Flight (4) is blocked.")
+    else:
+        print(f"{WARN} Props ON — LoRa may run 3, 4. Motor tests (1, 2) are blocked.")
+        print(f"{WARN} LoRa command 4 will FLY the drone with no local confirmation.")
+    listen_lora(port=LORA_PORT, baud=LORA_BAUD,
+                on_msg=lambda m: handle_lora_msg(master, m, props_off, motors))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Pixhawk bench-test missions")
     parser.add_argument("--device", default="/dev/ttyACM0")
@@ -287,18 +406,22 @@ def main():
         elif ans in ("no", "n"):
             props_off = False
 
+    # Options 5 (camera) and 6 (LoRa) are always selectable; the LoRa dispatcher
+    # enforces the props interlock per-command internally.
     if props_off:
         print(f"\n{PASS} Props off — motor tests available. Flight (3, 4) is locked out.")
-        allowed = {"1", "2"}
+        allowed = {"1", "2", "5", "6"}
     else:
         print(f"\n{WARN} Props ON — motor tests are locked out for safety.")
-        print(f"{WARN} Only flight missions (3, 4) are available.")
-        allowed = {"3", "4"}
+        print(f"{WARN} Flight missions (3, 4) available.")
+        allowed = {"3", "4", "5", "6"}
 
     print("\n  1) Test each motor for 3 s, one at a time")
     print("  2) Test all motors at the same time")
     print("  3) Arm, take off 3 ft, land, shut off (automatic — needs GPS)")
     print("  4) Manual RC flight in Stabilized mode (script arms + monitors)")
+    print("  5) Camera tracking display — show OAK-D person X/Y/Z (no flight)")
+    print("  6) LoRa remote — run missions from LoRa commands")
     print("  q) Quit")
 
     while True:
@@ -306,14 +429,19 @@ def main():
         if choice == "q":
             print("Bye.")
             return
-        if choice in ("1", "2", "3", "4"):
+        if choice in ("1", "2", "3", "4", "5", "6"):
             break
-        print("Enter 1, 2, 3, 4 or q.")
+        print("Enter 1, 2, 3, 4, 5, 6 or q.")
 
     if choice not in allowed:
         if props_off:
             sys.exit(f"{FAIL} Flight missions need props ON. Re-run after fitting props.")
         sys.exit(f"{FAIL} Motor tests need props OFF. Remove them and re-run.")
+
+    # Option 5 is camera-only — no flight controller needed.
+    if choice == "5":
+        listen_camera_coordinates()
+        return
 
     master = connect(args.device, args.baud)
     try:
@@ -323,8 +451,10 @@ def main():
             mission_2(master, args.motors)
         elif choice == "3":
             mission_3(master)
-        else:
+        elif choice == "4":
             mission_4(master)
+        elif choice == "6":
+            run_lora_listener(master, props_off, args.motors)
     except KeyboardInterrupt:
         print(f"\n{WARN} Interrupted — sending disarm just in case.")
         master.mav.command_long_send(
