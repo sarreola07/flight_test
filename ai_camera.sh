@@ -96,11 +96,27 @@ status() {
     fi
 }
 
+# Foreground preview window. The OAK-D allows only one owner, so stop any
+# headless instance first, then run the windowed publisher until it's closed.
+preview() {
+    if [[ ! -x "${CAMERA_PY}" ]]; then
+        notify "DepthAI python not found at ${CAMERA_PY}."
+        return 1
+    fi
+    if [[ -n "$(running_pid)" ]]; then
+        echo "Stopping the headless camera so the preview can open the OAK-D..."
+        stop >/dev/null 2>&1 || true
+    fi
+    echo "Opening preview window — press q in the window (or Ctrl-C) to close."
+    exec "${CAMERA_PY}" "${SCRIPT}" --preview
+}
+
 case "${1:-toggle}" in
     start)   start ;;
     stop)    stop ;;
     restart) stop; sleep 1; start ;;
     status)  status ;;
+    preview) preview ;;
     toggle)  if [[ -n "$(running_pid)" ]]; then stop; else start; fi ;;
-    *) echo "Usage: $0 [start|stop|restart|status|toggle]"; exit 2 ;;
+    *) echo "Usage: $0 [start|stop|restart|status|toggle|preview]"; exit 2 ;;
 esac

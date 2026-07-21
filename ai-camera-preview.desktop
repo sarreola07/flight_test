@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=AI Camera (preview)
+Comment=Open a live OAK-D window with person boxes and distance
+Exec=gnome-terminal --title=AI Camera Preview -- /home/jetson/Desktop/pixhawk-test/ai_camera.sh preview
+Icon=/home/jetson/Desktop/pixhawk-test/assets/ai-camera.png
+Terminal=false
+Categories=Utility;

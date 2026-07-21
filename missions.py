@@ -387,58 +387,18 @@ def run_lora_listener(master, props_off, motors):
                 on_msg=lambda m: handle_lora_msg(master, m, props_off, motors))
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Pixhawk bench-test missions")
-    parser.add_argument("--device", default="/dev/ttyACM0")
-    parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("--motors", type=int, default=6, help="motor count (hexarotor = 6)")
-    args = parser.parse_args()
-
-    print("=" * 52)
-    print(" Pixhawk missions — PX4 v1.13.3 hexarotor bench test")
-    print("=" * 52)
-
-    props_off = None
-    while props_off is None:
+def ask_props_state():
+    """Ask whether the props are removed. Returns True if props are OFF."""
+    while True:
         ans = input("\nAre the propellers REMOVED from the motors? (yes/no): ").strip().lower()
         if ans in ("yes", "y"):
-            props_off = True
-        elif ans in ("no", "n"):
-            props_off = False
+            return True
+        if ans in ("no", "n"):
+            return False
 
-    # Options 5 (camera) and 6 (LoRa) are always selectable; the LoRa dispatcher
-    # enforces the props interlock per-command internally.
-    if props_off:
-        print(f"\n{PASS} Props off — motor tests available. Flight (3, 4) is locked out.")
-        allowed = {"1", "2", "5", "6"}
-    else:
-        print(f"\n{WARN} Props ON — motor tests are locked out for safety.")
-        print(f"{WARN} Flight missions (3, 4) available.")
-        allowed = {"3", "4", "5", "6"}
 
-    print("\n  1) Test each motor for 3 s, one at a time")
-    print("  2) Test all motors at the same time")
-    print("  3) Arm, take off 3 ft, land, shut off (automatic — needs GPS)")
-    print("  4) Manual RC flight in Stabilized mode (script arms + monitors)")
-    print("  5) Camera tracking display — show OAK-D person X/Y/Z (no flight)")
-    print("  6) LoRa remote — run missions from LoRa commands")
-    print("  q) Quit")
-
-    while True:
-        choice = input("\nSelect mission: ").strip().lower()
-        if choice == "q":
-            print("Bye.")
-            return
-        if choice in ("1", "2", "3", "4", "5", "6"):
-            break
-        print("Enter 1, 2, 3, 4, 5, 6 or q.")
-
-    if choice not in allowed:
-        if props_off:
-            sys.exit(f"{FAIL} Flight missions need props ON. Re-run after fitting props.")
-        sys.exit(f"{FAIL} Motor tests need props OFF. Remove them and re-run.")
-
-    # Option 5 is camera-only — no flight controller needed.
+def run_selected(choice, props_off, args):
+    """Run one mission. Option 5 needs no flight controller; the rest connect."""
     if choice == "5":
         listen_camera_coordinates()
         return
@@ -462,6 +422,59 @@ def main():
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0)
     finally:
         master.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Pixhawk bench-test missions")
+    parser.add_argument("--device", default="/dev/ttyACM0")
+    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--motors", type=int, default=6, help="motor count (hexarotor = 6)")
+    args = parser.parse_args()
+
+    print("=" * 52)
+    print(" Pixhawk missions — PX4 v1.13.3 hexarotor bench test")
+    print("=" * 52)
+
+    props_off = ask_props_state()
+
+    # Menu loops until the user quits with 'q'. Options 5 (camera) and 6 (LoRa)
+    # are always available; the LoRa dispatcher enforces the props interlock too.
+    while True:
+        if props_off:
+            print(f"\n{PASS} Props OFF — motor tests (1, 2) available; flight (3, 4) locked out.")
+            allowed = {"1", "2", "5", "6"}
+        else:
+            print(f"\n{WARN} Props ON — flight (3, 4) available; motor tests (1, 2) locked out.")
+            allowed = {"3", "4", "5", "6"}
+
+        print("\n  1) Test each motor for 3 s, one at a time")
+        print("  2) Test all motors at the same time")
+        print("  3) Arm, take off 3 ft, land, shut off (automatic — needs GPS)")
+        print("  4) Manual RC flight in Stabilized mode (script arms + monitors)")
+        print("  5) Camera tracking display — show OAK-D person X/Y/Z (no flight)")
+        print("  6) LoRa remote — run missions from LoRa commands")
+        print("  p) Change props state (re-declare)")
+        print("  q) Quit")
+
+        choice = input("\nSelect mission (or q to quit): ").strip().lower()
+
+        if choice == "q":
+            print("Bye.")
+            return
+        if choice == "p":
+            props_off = ask_props_state()
+            continue
+        if choice not in ("1", "2", "3", "4", "5", "6"):
+            print(f"{WARN} Enter 1–6, p, or q.")
+            continue
+        if choice not in allowed:
+            need = "ON" if props_off else "OFF"
+            print(f"{FAIL} Mission {choice} needs props {need}. "
+                  f"Press 'p' to re-declare, or change the props first.")
+            continue
+
+        run_selected(choice, props_off, args)
+        print(f"\n{INFO} Mission finished — returning to menu (press q to quit).")
 
 
 if __name__ == "__main__":

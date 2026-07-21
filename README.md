@@ -98,7 +98,10 @@ Interactive bench-test program:
 ./venv/bin/python missions.py
 ```
 
-It first asks whether the propellers are removed, then offers:
+It first asks whether the propellers are removed, then shows a menu that **loops
+until you press `q`** — after each mission it returns to the menu so you can run
+another. Press `p` to re-declare the props state (to switch between motor tests
+and flight without restarting). It offers:
 
 | Mission | What it does | Requires |
 |---|---|---|
@@ -196,12 +199,23 @@ desktop notification either way), or from a terminal:
 
 ```bash
 ./ai_camera.sh            # toggle: start if stopped, stop if running
-./ai_camera.sh start      # explicit start
+./ai_camera.sh start      # explicit start (headless)
 ./ai_camera.sh stop       # explicit stop
 ./ai_camera.sh status     # RUNNING (PID) or stopped
+./ai_camera.sh preview    # open a live window to visually check the camera
 ```
 
 State and logs live in `~/.local/state/ai-camera/` (`camera.pid`, `camera.log`).
+
+### Visual check — preview window
+
+To *see* the camera feed with the detected person boxed and its X/Y/Z distance
+drawn on it, double-click **AI Camera (preview)** or run `./ai_camera.sh preview`.
+Press **q** in the window (or Ctrl-C) to close it. The preview still publishes
+coordinates on UDP 5005, so mission option 5 works while it is open.
+
+The OAK-D allows only one owner at a time, so `preview` first stops the headless
+tracker if it is running; start it again with the toggle when you are done.
 
 > The camera is **not** a boot service. If you want the core MAVLink/telemetry
 > link to come up automatically at boot instead, that belongs in its own systemd

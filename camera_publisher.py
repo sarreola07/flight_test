@@ -16,6 +16,7 @@ IMPORTANT: run this with the DepthAI environment, not the mission venv:
 The oak-camera systemd service starts this automatically on boot.
 """
 
+import argparse
 import json
 import os
 import socket
@@ -44,8 +45,11 @@ def log(msg):
     print(msg, flush=True)
 
 
-def build_pipeline(blob_path):
-    """Headless RGB + stereo-depth + MobileNet spatial detection pipeline."""
+def build_pipeline(blob_path, preview=False):
+    """RGB + stereo-depth + MobileNet spatial detection pipeline.
+
+    preview=True also streams the RGB frames out so a window can be drawn.
+    """
     pipeline = dai.Pipeline()
 
     cam_rgb = pipeline.create(dai.node.ColorCamera)
@@ -83,6 +87,12 @@ def build_pipeline(blob_path):
     cam_rgb.preview.link(spatial_nn.input)
     stereo.depth.link(spatial_nn.inputDepth)
     spatial_nn.out.link(xout_nn.input)
+
+    if preview:
+        xout_rgb = pipeline.create(dai.node.XLinkOut)
+        xout_rgb.setStreamName("rgb")
+        # passthrough gives the RGB frame the detections were computed on (synced)
+        spatial_nn.passthrough.link(xout_rgb.input)
     return pipeline
 
 
@@ -94,40 +104,87 @@ def nearest_person(detections):
     return min(people, key=lambda d: d.spatialCoordinates.z or float("inf"))
 
 
-def run_once(sock, blob_path):
-    """Open the camera and stream until the device drops or an error occurs."""
-    pipeline = build_pipeline(blob_path)
+def _draw_preview(cv2, frame, detections):
+    """Draw person boxes + X/Y/Z distance onto the RGB frame (in place)."""
+    h, w = frame.shape[:2]
+    for det in detections:
+        if det.label != PERSON_LABEL:
+            continue
+        x1, y1 = int(det.xmin * w), int(det.ymin * h)
+        x2, y2 = int(det.xmax * w), int(det.ymax * h)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        zx = det.spatialCoordinates.x / 1000.0
+        zy = det.spatialCoordinates.y / 1000.0
+        zz = det.spatialCoordinates.z / 1000.0
+        cv2.putText(frame, "person {:.0f}%".format(det.confidence * 100),
+                    (x1 + 6, y1 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        for i, txt in enumerate(("X {:+.2f} m".format(zx), "Y {:+.2f} m".format(zy),
+                                 "Z {:.2f} m".format(zz))):
+            cv2.putText(frame, txt, (x1 + 6, y1 + 40 + i * 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+
+def run_once(sock, blob_path, preview=False):
+    """Open the camera and stream until the device drops or (preview) the user quits.
+
+    Returns True if the user asked to quit (pressed q in the preview window).
+    """
+    cv2 = None
+    if preview:
+        import cv2  # only needed for the window; lives in the DepthAI env
+
+    pipeline = build_pipeline(blob_path, preview=preview)
     with dai.Device(pipeline) as device:
-        log("OAK-D connected (MxId {}). Publishing to {}:{}".format(
-            device.getMxId(), UDP_IP, UDP_PORT))
+        log("OAK-D connected (MxId {}). Publishing to {}:{}{}".format(
+            device.getMxId(), UDP_IP, UDP_PORT, "  [preview]" if preview else ""))
         det_queue = device.getOutputQueue(name="detections", maxSize=4, blocking=False)
+        rgb_queue = device.getOutputQueue(name="rgb", maxSize=4, blocking=False) if preview else None
+        win = "AI Camera - person tracking (press q to close)"
         last_report = 0.0
         while True:
             in_det = det_queue.get()  # blocks until a frame arrives
-            person = nearest_person(in_det.detections)
-            if person is None:
-                continue
-            payload = {
-                "x": person.spatialCoordinates.x / 1000.0,
-                "y": person.spatialCoordinates.y / 1000.0,
-                "z": person.spatialCoordinates.z / 1000.0,
-                "conf": float(person.confidence),
-            }
-            sock.sendto(json.dumps(payload).encode(), (UDP_IP, UDP_PORT))
-            now = time.time()
-            if now - last_report >= 1.0:   # throttle console logging to 1 Hz
-                log("person X:{x:+.2f} Y:{y:+.2f} Z:{z:.2f} m  ({conf:.0%})".format(**payload))
-                last_report = now
+            detections = in_det.detections
+
+            person = nearest_person(detections)
+            if person is not None:
+                payload = {
+                    "x": person.spatialCoordinates.x / 1000.0,
+                    "y": person.spatialCoordinates.y / 1000.0,
+                    "z": person.spatialCoordinates.z / 1000.0,
+                    "conf": float(person.confidence),
+                }
+                sock.sendto(json.dumps(payload).encode(), (UDP_IP, UDP_PORT))
+                now = time.time()
+                if now - last_report >= 1.0:   # throttle console logging to 1 Hz
+                    log("person X:{x:+.2f} Y:{y:+.2f} Z:{z:.2f} m  ({conf:.0%})".format(**payload))
+                    last_report = now
+
+            if preview:
+                in_rgb = rgb_queue.get()
+                frame = in_rgb.getCvFrame()
+                _draw_preview(cv2, frame, detections)
+                cv2.imshow(win, frame)
+                if cv2.waitKey(1) == ord("q"):
+                    cv2.destroyAllWindows()
+                    return True
 
 
 def main():
+    parser = argparse.ArgumentParser(description="OAK-D person tracker -> UDP")
+    parser.add_argument("--preview", action="store_true",
+                        help="show a live window with person boxes (needs a display)")
+    args = parser.parse_args()
+
     if not Path(BLOB_PATH).exists():
         sys.exit("Model blob not found: {}".format(BLOB_PATH))
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    log("Camera publisher starting. Blob: {}".format(BLOB_PATH))
+    log("Camera publisher starting{}. Blob: {}".format(
+        " (preview)" if args.preview else "", BLOB_PATH))
     while True:
         try:
-            run_once(sock, BLOB_PATH)
+            if run_once(sock, BLOB_PATH, preview=args.preview):
+                log("Preview closed — camera stopped.")
+                return
         except KeyboardInterrupt:
             log("Camera publisher stopped.")
             return
