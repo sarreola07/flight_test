@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=AI Camera (toggle)
+Comment=Start/stop OAK-D person tracking — does not affect the drone link
+Exec=/home/jetson/Desktop/pixhawk-test/ai_camera.sh toggle
+Icon=/home/jetson/Desktop/pixhawk-test/assets/ai-camera.png
+Terminal=false
+Categories=Utility;

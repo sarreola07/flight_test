@@ -102,7 +102,7 @@ It first asks whether the propellers are removed, then offers:
 | 2 | Spins all motors together for 3 s at 15% throttle | Props **OFF** |
 | 3 | Arms, takes off to 3 ft (0.91 m), hovers, lands, disarms | Props **ON**, GPS position fix, extra `FLY` confirmation |
 | 4 | Manual RC flight: switches to Stabilized, arms, then monitors while you fly with the transmitter | Props **ON**, RC link up, extra `FLY` confirmation |
-| 5 | Camera tracking display — shows the OAK-D's live person X/Y/Z. No flight. | `oak-camera` service running |
+| 5 | Camera tracking display — shows the OAK-D's live person X/Y/Z. No flight. | AI Camera toggle started |
 | 6 | LoRa remote — runs missions from LoRa commands (see table below) | LoRa module on `/dev/ttyUSB0` |
 
 Safety interlocks: motor tests are locked out while props are on, and flight is
@@ -123,7 +123,8 @@ Pixhawk--/dev/ttyACM0 MAVLink-->                                             mis
 
 - **`camera_publisher.py`** runs the OAK-D person detector headlessly (in
   `~/oak_drone_project/depthai-env`) and broadcasts the nearest person's
-  `{x, y, z, conf}` in metres. Started automatically on boot by `oak-camera.service`.
+  `{x, y, z, conf}` in metres. It is started/stopped **on demand** via
+  `ai_camera.sh` (see below) — never at boot.
 - **Option 5** subscribes to that UDP stream and prints live coordinates — pure
   telemetry, never touches the flight controller. (Autonomous *follow-flight* is
   intentionally not wired up on this PX4 vehicle yet; see Notes.)
@@ -166,29 +167,43 @@ Notes for this vehicle (PX4 v1.13.3, FMUv2):
   "No CPU load information" preflight check fails out of the box. We set
   `COM_CPU_MAX=-1` to disable that check.
 
-## Install: desktop icon + camera-on-boot
+## Install: desktop shortcuts
 
 ```bash
 bash install.sh
 ```
 
-This (asks for your sudo password once):
+No sudo, no systemd — this only installs two user-level Desktop shortcuts:
 
-1. Puts a **Hexacopter Mission** icon on the Desktop. Double-clicking it opens a
-   terminal running the mission menu (`run_missions.sh` → `missions.py`).
-2. Installs and enables **`oak-camera.service`**, which starts `camera_publisher.py`
-   on every boot so person coordinates are always flowing on UDP 5005.
+1. **Hexacopter Mission** — opens a terminal running the mission menu
+   (`run_missions.sh` → `missions.py`).
+2. **AI Camera (toggle)** — starts/stops the OAK-D tracker on demand.
 
-Check / control the camera service:
+## AI camera toggle (decoupled from the drone link)
+
+The AI camera tracking is **optional and manual**, deliberately separate from the
+core MAVLink/telemetry background services. Toggling it starts or stops
+`camera_publisher.py` as a plain user process that only reads the USB camera and
+publishes on UDP 5005 — it **never opens `/dev/ttyACM0`**, so it cannot restart
+the drone or interrupt background communications.
+
+Double-click the **AI Camera (toggle)** Desktop icon to flip it on/off (you get a
+desktop notification either way), or from a terminal:
 
 ```bash
-systemctl status oak-camera        # is it running?
-journalctl -u oak-camera -f        # live camera log
-sudo systemctl restart oak-camera  # restart it
+./ai_camera.sh            # toggle: start if stopped, stop if running
+./ai_camera.sh start      # explicit start
+./ai_camera.sh stop       # explicit stop
+./ai_camera.sh status     # RUNNING (PID) or stopped
 ```
 
-The camera service is **camera only** — it never arms or flies the drone. Flight
-happens solely through the mission menu (or a deliberate LoRa command).
+State and logs live in `~/.local/state/ai-camera/` (`camera.pid`, `camera.log`).
+
+> The camera is **not** a boot service. If you want the core MAVLink/telemetry
+> link to come up automatically at boot instead, that belongs in its own systemd
+> unit; to share the Pixhawk serial port with `missions.py`, front it with a
+> MAVLink router (e.g. `mavlink-routerd`) so one owner holds `/dev/ttyACM0` and
+> everything else connects over UDP.
 
 ## Follow-me code from classmates (`hexacopter-follow/`)
 

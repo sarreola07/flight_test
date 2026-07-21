@@ -1,46 +1,40 @@
 #!/usr/bin/env bash
-# Install the hexacopter environment:
-#   1. Desktop launcher icon (runs the mission menu)
-#   2. oak-camera boot service (starts the OAK-D camera publisher on power-on)
+# Install the two desktop shortcuts (no sudo, no systemd — user level only):
+#   * Hexacopter Mission — opens the mission menu in a terminal
+#   * AI Camera (toggle)  — starts/stops the OAK-D tracker on demand
+#
+# The AI camera is intentionally NOT a boot service: it is optional and toggled
+# by hand, fully decoupled from the core MAVLink/telemetry background services.
 #
 # Run from your desktop terminal:  bash install.sh
-# Asks for your sudo password once (to install the system service).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
-SERVICE="oak-camera.service"
-CAMERA_PY="/home/jetson/oak_drone_project/depthai-env/bin/python"
-
-echo "==> Repo: ${REPO}"
-
-# --- sanity checks -----------------------------------------------------------
-[[ -x "${REPO}/venv/bin/python" ]] || { echo "Missing venv — run: bash setup.sh"; exit 1; }
-[[ -x "${CAMERA_PY}" ]] || echo "WARNING: DepthAI env not found at ${CAMERA_PY} (camera service will fail until it exists)."
-
-# --- 1. desktop launcher -----------------------------------------------------
-echo "==> Installing desktop launcher..."
-chmod +x "${REPO}/run_missions.sh"
-DESK="${HOME}/Desktop/hexacopter-mission.desktop"
 APPS="${HOME}/.local/share/applications"
+DESKTOP_DIR="${HOME}/Desktop"
 mkdir -p "${APPS}"
-install -m 755 "${REPO}/hexacopter-mission.desktop" "${DESK}"
-install -m 644 "${REPO}/hexacopter-mission.desktop" "${APPS}/hexacopter-mission.desktop"
-# GNOME requires desktop launchers to be marked trusted before they run.
-gio set "${DESK}" metadata::trusted true 2>/dev/null || true
+
+chmod +x "${REPO}/run_missions.sh" "${REPO}/ai_camera.sh"
+
+install_launcher() {
+    local file="$1"          # basename of the .desktop in the repo
+    local dest="${DESKTOP_DIR}/${file}"
+    install -m 755 "${REPO}/${file}" "${dest}"
+    install -m 644 "${REPO}/${file}" "${APPS}/${file}"
+    # GNOME requires desktop launchers to be marked trusted before they run.
+    gio set "${dest}" metadata::trusted true 2>/dev/null || true
+    echo "    installed ${file}"
+}
+
+echo "==> Installing desktop shortcuts..."
+install_launcher "hexacopter-mission.desktop"
+install_launcher "ai-camera-toggle.desktop"
 update-desktop-database "${APPS}" 2>/dev/null || true
-echo "    Launcher on Desktop (double-click 'Hexacopter Mission')."
-
-# --- 2. camera boot service --------------------------------------------------
-echo "==> Installing ${SERVICE} (needs sudo)..."
-sudo install -m 644 "${REPO}/systemd/${SERVICE}" "/etc/systemd/system/${SERVICE}"
-sudo systemctl daemon-reload
-sudo systemctl enable "${SERVICE}"
-sudo systemctl restart "${SERVICE}"
-sleep 3
-echo
-sudo systemctl --no-pager --lines=5 status "${SERVICE}" || true
 
 echo
-echo "Done."
-echo "  - Camera publisher runs on every boot (systemctl status ${SERVICE})."
-echo "  - Double-click the Desktop icon to open the mission menu."
+echo "Done. On your Desktop:"
+echo "  - 'Hexacopter Mission' opens the mission menu."
+echo "  - 'AI Camera (toggle)' starts/stops the OAK-D tracker (toggle)."
+echo
+echo "The AI camera can also be driven from a terminal:"
+echo "  ./ai_camera.sh start | stop | status | restart"
