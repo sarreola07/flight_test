@@ -18,6 +18,10 @@ Other serial ports available on the Jetson if you later wire TELEM2 to the
 40-pin header: `/dev/ttyTHS1` and `/dev/ttyTHS2` (UARTs, typically 57600 or
 921600 baud — must match the `SER_TEL2_BAUD` PX4 parameter).
 
+> Reinstalling the Jetson (e.g. moving to NVMe)? The camera environment and
+> venvs live outside this repo — see [docs/REINSTALL.md](docs/REINSTALL.md) to
+> rebuild everything from a fresh clone.
+
 ## First-time setup
 
 ```bash
