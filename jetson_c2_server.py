@@ -147,7 +147,13 @@ class C2Server:
             return [p.message(p.HELLO_ACK, seq, proto=p.PROTO_VERSION,
                               fc=self.fc.name, props_off=self.props_off, **st)]
         if t == p.GET_MENU:
-            return [p.message(p.MENU, seq, items=self.menu())]
+            # A full menu (with needs/gps) exceeds the LoRa packet limit (~255 B)
+            # and the firmware's 240-byte line buffer, so it would be truncated.
+            # Send a compact id+name list; the server still enforces the props/GPS
+            # gates internally and explains any rejection. (Rich per-item menu
+            # streaming is a planned follow-up.)
+            compact = [{"id": i["id"], "name": i["name"]} for i in self.menu()]
+            return [p.message(p.MENU, seq, items=compact)]
         if t == p.PING:
             return [p.message(p.PONG, seq)]
         if t == p.WP_BEGIN:
