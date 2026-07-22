@@ -147,13 +147,12 @@ class C2Server:
             return [p.message(p.HELLO_ACK, seq, proto=p.PROTO_VERSION,
                               fc=self.fc.name, props_off=self.props_off, **st)]
         if t == p.GET_MENU:
-            # A full menu (with needs/gps) exceeds the LoRa packet limit (~255 B)
-            # and the firmware's 240-byte line buffer, so it would be truncated.
-            # Send a compact id+name list; the server still enforces the props/GPS
-            # gates internally and explains any rejection. (Rich per-item menu
-            # streaming is a planned follow-up.)
-            compact = [{"id": i["id"], "name": i["name"]} for i in self.menu()]
-            return [p.message(p.MENU, seq, items=compact)]
+            # Stream the menu one item per packet — a full menu in a single packet
+            # exceeds the LoRa limit (~255 B) and the firmware's 240-byte buffer.
+            # Each item (with its props/GPS flags) fits comfortably.
+            items = self.menu()
+            return [p.message(p.MENU, seq, item=it, last=(i == len(items) - 1))
+                    for i, it in enumerate(items)]
         if t == p.PING:
             return [p.message(p.PONG, seq)]
         if t == p.WP_BEGIN:
@@ -190,7 +189,8 @@ class C2Server:
 class LoRaLink:
     def __init__(self, port, baud):
         import serial
-        self.ser = serial.Serial(port, baud, timeout=0.2)
+        # exclusive=True so nothing else can grab the LoRa port and corrupt the link
+        self.ser = serial.Serial(port, baud, timeout=0.2, exclusive=True)
         self._buf = ""
 
     def send(self, msg):
@@ -243,6 +243,12 @@ def main():
     ap.add_argument("--props-on", action="store_true",
                     help="declare props ON (enables flight missions, disables motor tests)")
     args = ap.parse_args()
+
+    # Line-buffer stdout so logs reach the journal immediately under systemd.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, OSError):
+        pass
 
     if args.real:
         if missions is None:

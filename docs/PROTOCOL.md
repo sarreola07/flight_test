@@ -24,7 +24,7 @@ Example:
 | `HELLO` | client → jetson | — | link request (handshake) |
 | `HELLO_ACK` | jetson → client | `proto,armed,gps,batt` | link up + status |
 | `GET_MENU` | client → jetson | — | request the mission list |
-| `MENU` | jetson → client | `items[]` | list of `{id,name,needs,gps}` |
+| `MENU` | jetson → client | `item,last` | one mission `{id,name,needs,gps}`; streamed one per packet, `last:true` on the final |
 | `RUN` | client → jetson | `id` | run a mission |
 | `ACK` | jetson → client | `accepted,reason` / `i` / `uploaded` | accepted/rejected reply |
 | `DONE` | jetson → client | `id,result` | mission finished |
@@ -39,7 +39,11 @@ Example:
 ## Flows
 
 **Handshake / "connection established":** client sends `HELLO`, waits for
-`HELLO_ACK`. That reply is the moment the menu is shown.
+`HELLO_ACK`. That reply is the moment the menu is requested.
+
+**Menu:** client sends `GET_MENU`; the server streams one `MENU` message per
+mission (each fits a LoRa packet), the last flagged `last:true`. A full menu in a
+single message would exceed the ~255 B LoRa / 240 B firmware limit.
 
 **Run a mission:** `RUN{id}` → `ACK{accepted}`; if accepted, a later `DONE`.
 Flight missions are rejected (`accepted:false, reason`) until PX4's own checks

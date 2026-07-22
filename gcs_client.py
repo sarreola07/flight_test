@@ -95,7 +95,8 @@ class MockJetson:
             return [p.message(p.HELLO_ACK, seq, proto=p.PROTO_VERSION,
                               armed=False, gps="no fix", batt=11.4)]
         if t == p.GET_MENU:
-            return [p.message(p.MENU, seq, items=self.MENU)]
+            return [p.message(p.MENU, seq, item=it, last=(i == len(self.MENU) - 1))
+                    for i, it in enumerate(self.MENU)]
         if t == p.PING:
             return [p.message(p.PONG, seq)]
         if t == p.RUN:
@@ -173,8 +174,22 @@ class Client:
         return True
 
     def get_menu(self):
-        r = self.request(p.message(p.GET_MENU, self._next_seq()), p.MENU)
-        return r.get("items", []) if r else []
+        # The menu is streamed one item per packet (each fits a LoRa frame), so
+        # collect MENU messages until the one flagged last.
+        self.tx.send(p.message(p.GET_MENU, self._next_seq()))
+        items = []
+        end = time.time() + 8
+        while time.time() < end:
+            r = self.tx.poll()
+            if r is None:
+                time.sleep(0.02)
+                continue
+            if r.get("t") == p.MENU:
+                if r.get("item"):
+                    items.append(r["item"])
+                if r.get("last"):
+                    break
+        return items
 
     def run_mission(self, mid):
         r = self.request(p.message(p.RUN, self._next_seq(), id=mid), {p.ACK}, timeout=8)
