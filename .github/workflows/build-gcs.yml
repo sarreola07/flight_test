@@ -1,0 +1,37 @@
+name: Build Venator GCS
+
+# Builds the portable laptop client into a Windows .exe and a macOS binary.
+# PyInstaller can only build for the OS it runs on, so we use GitHub's Windows
+# and macOS runners. Download the results from the run's Artifacts section.
+
+on:
+  push:
+    paths:
+      - "gcs_client.py"
+      - "c2_protocol.py"
+      - ".github/workflows/build-gcs.yml"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: VenatorGCS-windows
+          - os: macos-latest
+            artifact: VenatorGCS-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyserial pyinstaller
+      - run: pyinstaller --onefile --console --name VenatorGCS gcs_client.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
