@@ -1,0 +1,18 @@
+[Unit]
+Description=Venator C2 server — LoRa command link to the drone
+After=multi-user.target
+
+[Service]
+Type=simple
+User=jetson
+WorkingDirectory=/home/jetson/Desktop/pixhawk-test
+# Real flight controller, props OFF by default: only motor tests are runnable
+# remotely; flight missions stay rejected until this is deliberately changed to
+# add --props-on. Nothing arms on boot — arming only happens on a confirmed
+# command that also passes PX4's own pre-arm checks.
+ExecStart=/home/jetson/Desktop/pixhawk-test/venv/bin/python /home/jetson/Desktop/pixhawk-test/jetson_c2_server.py --real
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

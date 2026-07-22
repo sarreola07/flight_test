@@ -10,8 +10,8 @@ the Jetson**, including a "fly to these coordinates" mission.
 | 0 | NVMe install + restore project (see [REINSTALL.md](REINSTALL.md)) | ✅ done |
 | 1 | C2 protocol ([PROTOCOL.md](PROTOCOL.md), `c2_protocol.py`) | ✅ done |
 | 2 | Portable laptop client + mock + CI to build `.exe`/`.app` | 🔵 in progress |
-| 3 | Bidirectional Heltec firmware (half-duplex transceiver) | ⬜ next hardware step (you flash) |
-| 4 | Jetson C2 server + systemd boot service (zero-touch) | ⬜ |
+| 3 | Bidirectional Heltec firmware (half-duplex transceiver) | ✅ written — you flash + two-terminal test |
+| 4 | Jetson C2 server + systemd boot service (zero-touch) | 🔵 server done & tested (mock FC); real link pending firmware |
 | 5 | GPS module + waypoint flight (`AUTO.MISSION`) | ⬜ blocked on GPS hardware |
 | 6 | Polish: auto-launch agents, saved "places", browser GUI, OFFBOARD follow | ⬜ |
 
@@ -26,10 +26,13 @@ the Jetson**, including a "fly to these coordinates" mission.
 - **3 — Firmware:** merge the two working sketches into one half-duplex
   transceiver (transparent line bridge, same 915 MHz/SF7/syncword). Flash both
   sticks.
-- **4 — Jetson server:** headless server owning `/dev/ttyUSB0` (LoRa) and
-  `/dev/ttyACM0` (Pixhawk); serves the menu, runs missions, streams ACK/DONE.
-  Safety: props/geofence gates, two-step arm confirm, link-loss → RTL, no
-  auto-arm on boot. Install as a systemd service → Jetson is zero-touch.
+- **4 — Jetson server** *(server done):* `jetson_c2_server.py` owns the LoRa
+  serial and the Pixhawk; serves the menu, runs missions (reusing `missions.py`),
+  streams ACK/DONE. Defaults to a **mock FC** and **props OFF** (safe); `--real`
+  connects the Pixhawk, `--props-on` enables flight. Tested end-to-end against the
+  real client over a loopback — props + GPS gates verified. `systemd/venator-c2.service`
+  is the zero-touch boot unit (enable deliberately). Still TODO: two-step arm
+  confirm, link-loss → RTL, and threaded execution so ABORT/heartbeat work mid-mission.
 - **5 — Waypoint flight:** fit a GPS (M8N → Pixhawk GPS port; `EKF2_AID_MASK=1`
   already set). Upload via `MISSION_ITEM_INT` → `AUTO.MISSION`, altitude cap +
   RTL-last, bench-validate acceptance, then fly outdoors.
