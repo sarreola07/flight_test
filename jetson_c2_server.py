@@ -22,6 +22,8 @@ import time
 
 import c2_protocol as p
 
+MAX_ALT_M = 50.0   # reject uploaded waypoints above this relative altitude
+
 # Reuse the tested mission logic and MAVLink helpers from missions.py
 try:
     import missions
@@ -94,9 +96,94 @@ class RealFC:
         return True, "done"
 
     def upload_waypoints(self, wps):
-        # Phase 5 completes the PX4 mission upload + AUTO.MISSION flight. For now
-        # validate and report; without a GPS fix PX4 could not fly it anyway.
-        return len(wps), 0, "validated (upload+fly lands in Phase 5, needs GPS)"
+        """Validate waypoints, build a takeoff→waypoints→RTL mission, upload to PX4.
+
+        Returns (accepted_count, rejected_count, note). Uploading works without a
+        GPS fix (PX4 just stores the plan); it only flies once armed with a fix.
+        """
+        valid, rejected = [], 0
+        for wp in wps:
+            try:
+                lat, lon, alt = float(wp[0]), float(wp[1]), float(wp[2])
+            except (TypeError, ValueError, IndexError):
+                rejected += 1
+                continue
+            if not (-90 <= lat <= 90) or not (-180 <= lon <= 180) or (lat == 0 and lon == 0):
+                rejected += 1
+                continue
+            if not (0 < alt <= MAX_ALT_M):
+                rejected += 1
+                continue
+            valid.append((lat, lon, alt))
+
+        if not valid:
+            return 0, rejected, "no valid waypoints (check lat/lon and 0<alt<=%g m)" % MAX_ALT_M
+
+        items = self._build_mission(valid)
+        result = self._upload_mission(items)
+        if result == mavutil.mavlink.MAV_MISSION_ACCEPTED:
+            return len(valid), rejected, \
+                "PX4 accepted mission ({} items: takeoff + {} wp + RTL)".format(len(items), len(valid))
+        name = (mavutil.mavlink.enums["MAV_MISSION_RESULT"][result].name
+                if result is not None else "no MISSION_ACK (timeout)")
+        return 0, len(wps), "PX4 rejected mission: {}".format(name)
+
+    def _build_mission(self, valid):
+        """takeoff (to first wp alt) -> NAV_WAYPOINTs -> RTL.
+
+        Positional items use the global relative-alt frame; RTL has no position,
+        so it must use MAV_FRAME_MISSION or PX4 rejects the whole mission as
+        UNSUPPORTED (verified on this FMUv2 / PX4 1.13.3).
+        """
+        REL = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT
+        MISSION = mavutil.mavlink.MAV_FRAME_MISSION
+        items = []
+
+        def item(seq, cmd, frame=REL, x=0, y=0, z=0.0, p1=0, p2=0, p3=0, p4=0):
+            return dict(seq=seq, frame=frame, command=cmd, current=1 if seq == 0 else 0,
+                        autocontinue=1, p1=p1, p2=p2, p3=p3, p4=p4, x=x, y=y, z=z)
+
+        seq = 0
+        items.append(item(seq, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, z=valid[0][2]))
+        for lat, lon, alt in valid:
+            seq += 1
+            items.append(item(seq, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                              x=int(lat * 1e7), y=int(lon * 1e7), z=alt, p2=2.0))  # 2 m accept radius
+        seq += 1
+        items.append(item(seq, mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, frame=MISSION))
+        return items
+
+    def _upload_mission(self, items, timeout=15):
+        """Run the MAVLink mission upload handshake. Returns the MISSION_ACK type."""
+        m = self.master
+        m.mav.mission_count_send(m.target_system, m.target_component,
+                                 len(items), mavutil.mavlink.MAV_MISSION_TYPE_MISSION)
+        start = time.time()
+        while time.time() - start < timeout:
+            msg = m.recv_match(type=["MISSION_REQUEST_INT", "MISSION_REQUEST", "MISSION_ACK"],
+                               blocking=True, timeout=2)
+            if msg is None:
+                continue
+            if msg.get_type() == "MISSION_ACK":
+                return msg.type
+            seq = msg.seq
+            if seq >= len(items):
+                continue
+            it = items[seq]
+            m.mav.mission_item_int_send(
+                m.target_system, m.target_component,
+                it["seq"], it["frame"], it["command"], it["current"], it["autocontinue"],
+                it["p1"], it["p2"], it["p3"], it["p4"], it["x"], it["y"], it["z"],
+                mavutil.mavlink.MAV_MISSION_TYPE_MISSION)
+        return None
+
+    def clear_mission(self):
+        """Erase the uploaded mission from the FC. Returns True if acknowledged."""
+        m = self.master
+        m.mav.mission_clear_all_send(m.target_system, m.target_component,
+                                     mavutil.mavlink.MAV_MISSION_TYPE_MISSION)
+        ack = m.recv_match(type="MISSION_ACK", blocking=True, timeout=5)
+        return bool(ack and ack.type == mavutil.mavlink.MAV_MISSION_ACCEPTED)
 
     def close(self):
         try:
