@@ -250,6 +250,21 @@ class Client:
         self.tx.send(p.message(p.CONFIRM, self._next_seq()))
         self.monitor_flight()
 
+    def mission_1_flow(self, mid):
+        """Mission 1: server prepares (takeoff/hover/detect/land), two-step confirm."""
+        ack = self.request(p.message(p.RUN, self._next_seq(), id=mid), {p.ACK}, timeout=10)
+        if not ack or not ack.get("accepted"):
+            print(f"{C_WARN}Cannot start Mission 1: {ack.get('reason') if ack else 'no response'}{C_OFF}")
+            return
+        print(f"{C_WARN}SAFETY: {ack.get('reason')}{C_OFF}")
+        print(f"{C_DIM}Start the AI camera first (./ai_camera.sh start) so it can detect people.{C_OFF}")
+        print(f"{C_WARN}The drone will ARM and TAKE OFF. Ctrl-C during flight = abort (return home).{C_OFF}")
+        if input("Type LAUNCH to arm and take off: ").strip().lower() != "launch":
+            print("Aborted — not flying.")
+            return
+        self.tx.send(p.message(p.CONFIRM, self._next_seq()))
+        self.monitor_flight()
+
     def monitor_flight(self):
         """Send flight heartbeats, show live status, Ctrl-C to abort (RTL)."""
         print(f"{C_OK}Launch confirmed.{C_OFF} Monitoring flight — Ctrl-C to abort (return home).")
@@ -267,7 +282,14 @@ class Client:
                 t = r.get("t")
                 if t == p.STATUS:
                     tag = "  [RTL]" if r.get("rtl") else ""
-                    print(f"{C_OK}alt {r.get('alt')} m  mode {r.get('mode')}  armed {r.get('armed')}{tag}{C_OFF}")
+                    phase = f"  {r['phase']}" if r.get("phase") else ""
+                    who = ""
+                    if r.get("person") is not None:
+                        pz = r.get("pz")
+                        who = ("  person YES" + (f" @ {pz} m" if pz else "")) if r["person"] else "  person no"
+                        who += f" (seen {r.get('seen', 0)})"
+                    print(f"{C_OK}alt {r.get('alt')} m  mode {r.get('mode')}{phase}  "
+                          f"armed {r.get('armed')}{who}{tag}{C_OFF}")
                 elif t == p.LOG:
                     print(f"{C_DIM}  drone: {r.get('text','')}{C_OFF}")
                 elif t == p.DONE:
@@ -316,11 +338,13 @@ def menu_loop(client):
         item = next((i for i in items if i["id"] == mid), None)
         if item is None:
             print("No such mission."); continue
-        # id 5 (waypoints) uses the upload flow; everything else is a plain RUN
-        if item["name"].lower().startswith("fly to waypoints"):
-            client.upload_waypoints()
+        name = item["name"].lower()
+        if name.startswith("fly to waypoints"):
+            client.upload_waypoints()          # collect + upload + two-step fly
+        elif name.startswith("mission 1"):
+            client.mission_1_flow(mid)          # prepare + two-step fly (hover+detect)
         else:
-            client.run_mission(mid)
+            client.run_mission(mid)             # motor tests etc.
 
 
 def main():

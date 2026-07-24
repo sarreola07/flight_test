@@ -18,6 +18,8 @@ rejected unless props are declared ON (--props-on) and the FC's own checks pass
 """
 import argparse
 import glob
+import json
+import socket
 import sys
 import time
 
@@ -27,6 +29,13 @@ MAX_ALT_M = 50.0        # reject uploaded waypoints above this relative altitude
 LINK_LOSS_S = 4.0       # in flight, no client ping for this long -> RTL failsafe
 FLIGHT_MAX_S = 600.0    # hard cap on a monitored flight -> RTL
 STATUS_INTERVAL_S = 1.0 # how often to push in-flight status to the client
+
+# --- Mission 1: hover & detect ---
+# GPS-safe hover altitude. A true 3 ft (0.91 m) hold is unsafe on GPS alone
+# (several-metre vertical error); set this to 0.91 once the downward lidar is in.
+HOVER_ALT_M = 2.0
+HOVER_TIME_S = 60.0     # how long to hover and detect people
+CAMERA_UDP_PORT = 5005  # OAK-D publisher (ai_camera.sh) broadcasts person X/Y/Z here
 
 
 def find_fc_device(default="/dev/ttyACM0"):
@@ -106,8 +115,10 @@ class MockFC:
 
     def flight_state(self):
         now = time.time()
-        # simulate the mission finishing (auto RTL+land) ~4 s after takeoff
-        if self._armed and self._t_land is None and now - self._t_arm > 4.0:
+        # AUTO.MISSION completes on its own ~4 s after takeoff (mock). TAKEOFF/HOLD
+        # (Mission 1) keeps hovering until the server explicitly commands LAND/RTL.
+        if (self._armed and self._t_land is None and self._mode == "MISSION"
+                and now - self._t_arm > 4.0):
             self._t_land = now
         # simulate touchdown + auto-disarm ~1.5 s after landing starts
         if self._armed and self._t_land and now - self._t_land > 1.5:
@@ -309,14 +320,16 @@ class C2Server:
         self.motors = motors
         self.log = log
         self._wp = []
-        self._fly_ready = False   # set by a validated FLY_REQ, consumed by CONFIRM
+        self._fly_ready = False        # set by a validated FLY_REQ/prep, consumed by CONFIRM
+        self._mission1_pending = False  # CONFIRM should run Mission 1, not a waypoint flight
 
     def menu(self):
         return [
             {"id": 1, "name": "Sequential motor test", "needs": "props_off"},
             {"id": 2, "name": "All-motor test", "needs": "props_off"},
-            {"id": 3, "name": "Auto takeoff & land (3 ft)", "needs": "props_on", "gps": True},
-            {"id": 4, "name": "Fly to waypoints", "needs": "props_on", "gps": True},
+            {"id": 3, "name": "Fly to waypoints", "needs": "props_on", "gps": True},
+            {"id": 4, "name": "Mission 1: hover + detect + land", "needs": "props_on",
+             "gps": True, "fly": "mission1"},
         ]
 
     def _validate(self, mid):
@@ -376,20 +389,147 @@ class C2Server:
         return True, "ready — arm + fly takeoff->waypoints->RTL"
 
     def run_and_report(self, msg, send):
-        """Handle a RUN: ACK, execute (blocking), then DONE — via send(msg)."""
+        """Handle a RUN. Motor tests execute immediately; flight missions are
+        *prepared* and wait for a CONFIRM (two-step arm)."""
         seq = msg.get("seq", 0)
         mid = msg.get("id")
         accepted, reason = self._validate(mid)
-        send(p.message(p.ACK, seq, id=mid, accepted=accepted, reason=reason))
         if not accepted:
+            send(p.message(p.ACK, seq, id=mid, accepted=False, reason=reason))
             self.log(f"RUN {mid} rejected: {reason}")
             return
+        item = next((i for i in self.menu() if i["id"] == mid), {})
+        if item.get("fly") == "mission1":
+            self._mission1_pending = True
+            self._fly_ready = True
+            send(p.message(p.ACK, seq, id=mid, accepted=True, confirm_required=True,
+                           reason="Mission 1: takeoff to {:g} m, hover {:d} s + detect people, "
+                                  "land in place. Confirm to launch.".format(HOVER_ALT_M, int(HOVER_TIME_S))))
+            self.log("Mission 1 prepared — awaiting CONFIRM")
+            return
+        send(p.message(p.ACK, seq, id=mid, accepted=True, reason=reason))
         self.log(f"RUN {mid} accepted — executing")
         try:
             ok, result = self.fc.run_mission(mid, self.motors)
         except Exception as exc:
             ok, result = False, f"error: {exc}"
         send(p.message(p.DONE, seq, id=mid, result=result if ok else f"FAILED: {result}"))
+
+    # -- camera (person detection during Mission 1) --------------------------
+    def _open_camera(self):
+        """UDP socket to receive the OAK-D publisher's person X/Y/Z, or None."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setblocking(False)
+            s.bind(("127.0.0.1", CAMERA_UDP_PORT))
+            return s
+        except OSError:
+            return None
+
+    @staticmethod
+    def _read_person(sock):
+        """Drain the camera socket, return the latest person dict or None."""
+        if sock is None:
+            return None
+        latest = None
+        for _ in range(20):
+            try:
+                data, _addr = sock.recvfrom(1024)
+            except (BlockingIOError, OSError):
+                break
+            try:
+                latest = json.loads(data.decode())
+            except (ValueError, UnicodeDecodeError):
+                pass
+        return latest
+
+    def run_mission1(self, link, send):
+        """Mission 1: arm -> takeoff -> hover HOVER_TIME_S while reporting detected
+        people -> land in place. Same link-loss RTL / abort failsafes as run_flight."""
+        self._mission1_pending = False
+        if not self._fly_ready:
+            send(p.message(p.ACK, 0, accepted=False, reason="no confirmed flight pending"))
+            return
+        self._fly_ready = False
+        cam = self._open_camera()
+
+        send(p.message(p.LOG, 0, text="Mission 1: arming"))
+        self.log("MISSION1: arming")
+        try:
+            if not self.fc.arm():
+                send(p.message(p.DONE, 0, id="mission1", result="FAILED: arm rejected"))
+                return
+            send(p.message(p.LOG, 0, text="armed — takeoff to {:g} m".format(HOVER_ALT_M)))
+            self.fc.set_flight_mode("TAKEOFF")
+        except Exception as exc:
+            send(p.message(p.DONE, 0, id="mission1", result=f"FAILED: {exc}"))
+            return
+
+        phase = "takeoff"
+        hover_start = None
+        people_seen = 0
+        person_present = False
+        last_ping = time.time()
+        last_status = 0.0
+        rtl = False
+        deadline = time.time() + FLIGHT_MAX_S
+        while time.time() < deadline:
+            now = time.time()
+            msg = link.poll()
+            if msg:
+                mt = msg.get("t")
+                if mt == p.PING:
+                    last_ping = now
+                    send(p.message(p.PONG, msg.get("seq", 0)))
+                elif mt == p.ABORT and not rtl:
+                    send(p.message(p.LOG, 0, text="ABORT — returning home"))
+                    self.fc.set_flight_mode("RTL")
+                    rtl = True
+            if not rtl and now - last_ping > LINK_LOSS_S:
+                self.log("MISSION1: LINK LOST -> RTL")
+                send(p.message(p.LOG, 0, text="LINK LOST — returning home"))
+                self.fc.set_flight_mode("RTL")
+                rtl = True
+
+            st = self.fc.flight_state()
+            person = self._read_person(cam)
+            if person is not None:
+                if not person_present:
+                    people_seen += 1
+                person_present = True
+            else:
+                person_present = False
+
+            if not rtl:
+                if phase == "takeoff" and st["alt"] >= HOVER_ALT_M * 0.9:
+                    phase = "hover"
+                    hover_start = now
+                    send(p.message(p.LOG, 0, text="hovering — detecting people"))
+                elif phase == "hover" and hover_start and now - hover_start > HOVER_TIME_S:
+                    phase = "land"
+                    self.fc.set_flight_mode("LAND")
+                    send(p.message(p.LOG, 0, text="hover complete — landing in place"))
+
+            if now - last_status >= STATUS_INTERVAL_S:
+                send(p.message(p.STATUS, 0, rtl=rtl, phase="RTL" if rtl else phase,
+                               person=person_present, seen=people_seen,
+                               pz=round(person["z"], 2) if person else None, **st))
+                last_status = now
+
+            if not st["armed"]:
+                if cam:
+                    cam.close()
+                send(p.message(p.DONE, 0, id="mission1",
+                               result="landed & disarmed — {} person-detection(s){}".format(
+                                   people_seen, " (RTL)" if rtl else "")))
+                self.log("MISSION1: landed & disarmed")
+                return
+            time.sleep(0.15)
+
+        if cam:
+            cam.close()
+        self.fc.set_flight_mode("RTL")
+        send(p.message(p.DONE, 0, id="mission1", result="time cap -> RTL"))
 
     def run_flight(self, link, send):
         """CONFIRM received: arm + AUTO.MISSION, then monitor with a link-loss
@@ -497,7 +637,10 @@ def serve(server, link, log=print):
         if t == p.RUN:
             server.run_and_report(msg, link.send)
         elif t == p.CONFIRM:
-            server.run_flight(link, link.send)
+            if server._mission1_pending:
+                server.run_mission1(link, link.send)
+            else:
+                server.run_flight(link, link.send)
         else:
             for reply in server.handle(msg):
                 link.send(reply)
