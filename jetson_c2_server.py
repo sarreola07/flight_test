@@ -58,6 +58,17 @@ def find_fc_device(default="/dev/ttyACM0"):
     acms = sorted(glob.glob("/dev/ttyACM*"))
     return acms[0] if acms else default
 
+
+def find_lora_device(default="/dev/ttyUSB0"):
+    """Locate the Heltec LoRa stick robustly (it's a CP2102 USB-UART), so a
+    replug (ttyUSB0->ttyUSB1) can't kill the service."""
+    for pat in ("/dev/serial/by-id/*CP2102*", "/dev/serial/by-id/*Silicon_Labs*"):
+        matches = sorted(glob.glob(pat))
+        if matches:
+            return matches[0]
+    usbs = sorted(glob.glob("/dev/ttyUSB*"))
+    return usbs[0] if usbs else default
+
 # Reuse the tested mission logic and MAVLink helpers from missions.py
 try:
     import missions
@@ -828,7 +839,8 @@ def wait_for_fc(link, args):
 
 def main():
     ap = argparse.ArgumentParser(description="Venator Jetson C2 server")
-    ap.add_argument("--lora-port", default="/dev/ttyUSB0")
+    ap.add_argument("--lora-port", default="auto",
+                    help="LoRa stick serial port, or 'auto' to detect by stable ID")
     ap.add_argument("--lora-baud", type=int, default=115200)
     ap.add_argument("--fc-device", default="auto",
                     help="Pixhawk serial port, or 'auto' to detect by stable ID")
@@ -848,10 +860,12 @@ def main():
 
     # Open the LoRa link FIRST so the operator gets answers even when the
     # flight controller is missing (previously this crash-looped in silence).
+    lora_port = find_lora_device() if args.lora_port == "auto" else args.lora_port
+    print("LoRa device: {}".format(lora_port), flush=True)
     try:
-        link = LoRaLink(args.lora_port, args.lora_baud)
+        link = LoRaLink(lora_port, args.lora_baud)
     except Exception as e:
-        sys.exit(f"Could not open LoRa port {args.lora_port}: {e}")
+        sys.exit(f"Could not open LoRa port {lora_port}: {e}")
 
     if args.real:
         if missions is None:
