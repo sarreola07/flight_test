@@ -14,6 +14,7 @@ Packaged into VenatorGCS(.exe/.app) by the GitHub Actions workflow.
 """
 import argparse
 import sys
+import threading
 import time
 
 import c2_protocol as p
@@ -83,9 +84,9 @@ class MockJetson:
     MENU = [
         {"id": 1, "name": "Sequential motor test", "needs": "props_off"},
         {"id": 2, "name": "All-motor test",        "needs": "props_off"},
-        {"id": 3, "name": "Camera tracking status", "needs": None},
-        {"id": 4, "name": "Auto takeoff & land (3 ft)", "needs": "props_on", "gps": True},
-        {"id": 5, "name": "Fly to waypoints",       "needs": "props_on", "gps": True},
+        {"id": 3, "name": "Fly to waypoints",      "needs": "props_on", "gps": True},
+        {"id": 4, "name": "Mission 1: hover + detect + land", "needs": "props_on", "gps": True},
+        {"id": 5, "name": "Mission 2: follow person", "needs": "props_on", "gps": True},
     ]
 
     def handle(self, m):
@@ -265,6 +266,65 @@ class Client:
         self.tx.send(p.message(p.CONFIRM, self._next_seq()))
         self.monitor_flight()
 
+    def mission_2_flow(self, mid):
+        """Mission 2 (follow-me): prepare, two-step confirm, then follow monitor."""
+        ack = self.request(p.message(p.RUN, self._next_seq(), id=mid), {p.ACK}, timeout=10)
+        if not ack or not ack.get("accepted"):
+            print(f"{C_WARN}Cannot start Mission 2: {ack.get('reason') if ack else 'no response'}{C_OFF}")
+            return
+        print(f"{C_WARN}SAFETY: {ack.get('reason')}{C_OFF}")
+        print(f"{C_DIM}Start the AI camera first (./ai_camera.sh start) so it can see the person.{C_OFF}")
+        print(f"{C_WARN}The drone will ARM, TAKE OFF, and FOLLOW. Ctrl-C = abort (RTL).{C_OFF}")
+        if input("Type LAUNCH to arm and take off: ").strip().lower() != "launch":
+            print("Aborted — not flying.")
+            return
+        self.tx.send(p.message(p.CONFIRM, self._next_seq()))
+        self.monitor_follow()
+
+    def monitor_follow(self):
+        """Follow monitor: pings + live status; type Enter to STOP (land), Ctrl-C to abort (RTL)."""
+        print(f"{C_OK}Following.{C_OFF} Press Enter to STOP (land in place); Ctrl-C to abort (return home).")
+        stop_evt = threading.Event()
+        threading.Thread(target=lambda: (sys.stdin.readline(), stop_evt.set()), daemon=True).start()
+        last_ping = 0.0
+        try:
+            while True:
+                now = time.time()
+                if stop_evt.is_set():
+                    stop_evt.clear()
+                    print(f"{C_WARN}STOP — landing in place...{C_OFF}")
+                    self.tx.send(p.message(p.STOP, self._next_seq()))
+                if now - last_ping > 1.0:
+                    self.tx.send(p.message(p.PING, self._next_seq()))
+                    last_ping = now
+                r = self.tx.poll()
+                if r is None:
+                    time.sleep(0.05)
+                    continue
+                t = r.get("t")
+                if t == p.STATUS:
+                    who = "person YES" if r.get("person") else "person no"
+                    if r.get("pz"):
+                        who += f" @ {r.get('pz')} m"
+                    foll = " following" if r.get("following") else ""
+                    tag = "  [RTL]" if r.get("rtl") else ""
+                    print(f"{C_OK}alt {r.get('alt')} m  {r.get('phase')}  {who}{foll}{tag}{C_OFF}")
+                elif t == p.LOG:
+                    print(f"{C_DIM}  drone: {r.get('text','')}{C_OFF}")
+                elif t == p.DONE:
+                    print(f"{C_OK}Mission 2 complete:{C_OFF} {r.get('result','')}")
+                    return
+        except KeyboardInterrupt:
+            print(f"\n{C_WARN}ABORT — returning home...{C_OFF}")
+            self.tx.send(p.message(p.ABORT, self._next_seq()))
+            end = time.time() + 90
+            while time.time() < end:
+                r = self.tx.poll()
+                if r and r.get("t") == p.DONE:
+                    print(f"{C_OK}Mission 2 complete:{C_OFF} {r.get('result','')}")
+                    return
+                time.sleep(0.1)
+
     def monitor_flight(self):
         """Send flight heartbeats, show live status, Ctrl-C to abort (RTL)."""
         print(f"{C_OK}Launch confirmed.{C_OFF} Monitoring flight — Ctrl-C to abort (return home).")
@@ -343,6 +403,8 @@ def menu_loop(client):
             client.upload_waypoints()          # collect + upload + two-step fly
         elif name.startswith("mission 1"):
             client.mission_1_flow(mid)          # prepare + two-step fly (hover+detect)
+        elif name.startswith("mission 2"):
+            client.mission_2_flow(mid)          # prepare + two-step fly (follow-me)
         else:
             client.run_mission(mid)             # motor tests etc.
 

@@ -14,6 +14,7 @@ the Jetson**, including a "fly to these coordinates" mission.
 | 4 | Jetson C2 server + systemd boot service (zero-touch) | ✅ working over real LoRa (motor test); boot service + rich menu done |
 | 5 | GPS + waypoint flight | 🔵 upload + flight trigger + two-step arm + link-loss RTL built & bench-tested; real outdoor flight pending a fix |
 | — | Mission 1: hover + detect people + land | 🔵 built & bench-tested (mock); hover 2 m on GPS, person detection over LoRa; real flight outdoors, true 3 ft with lidar |
+| — | Mission 2: follow the person until LoRa STOP | 🔵 built & bench-tested (mock); OFFBOARD velocity follow (keep 3 m), STOP->land, camera-loss->hover, link-loss->RTL |
 | 6 | Polish: auto-launch agents, saved "places", browser GUI, OFFBOARD follow | ⬜ |
 
 ## Phase details

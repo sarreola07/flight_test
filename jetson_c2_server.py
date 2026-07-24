@@ -37,6 +37,14 @@ HOVER_ALT_M = 2.0
 HOVER_TIME_S = 60.0     # how long to hover and detect people
 CAMERA_UDP_PORT = 5005  # OAK-D publisher (ai_camera.sh) broadcasts person X/Y/Z here
 
+# --- Mission 2: follow-me (OFFBOARD velocity control) ---
+FOLLOW_DIST_M = 3.0     # keep this distance from the person
+FOLLOW_DIST_DEAD = 0.5  # deadband on distance (m)
+FOLLOW_X_DEAD = 0.3     # deadband on horizontal offset (m) before yawing
+FOLLOW_FWD_MPS = 0.5    # forward/back speed
+FOLLOW_YAW_RPS = 0.35   # yaw rate (rad/s, ~20 deg/s)
+CAMERA_LOSS_S = 1.0     # no person for this long -> hover in place (don't drift)
+
 
 def find_fc_device(default="/dev/ttyACM0"):
     """Locate the Pixhawk robustly, so a USB replug (ttyACM0->ttyACM1) can't
@@ -113,6 +121,9 @@ class MockFC:
             self._t_land = time.time()
         return True
 
+    def send_velocity(self, vx, vy, vz, yaw_rate):
+        self._last_vel = (vx, vy, vz, yaw_rate)   # recorded for tests
+
     def flight_state(self):
         now = time.time()
         # AUTO.MISSION completes on its own ~4 s after takeoff (mock). TAKEOFF/HOLD
@@ -188,9 +199,21 @@ class RealFC:
         return True
 
     def set_flight_mode(self, mode):
-        # mode is a px4_map key: "MISSION", "RTL", "LAND", "TAKEOFF"
+        # mode is a px4_map key: "MISSION", "RTL", "LAND", "TAKEOFF", "OFFBOARD"
         self.master.set_mode_px4(*mavutil.px4_map[mode])
         return True
+
+    def send_velocity(self, vx, vy, vz, yaw_rate):
+        """Body-frame velocity + yaw-rate setpoint (for OFFBOARD following).
+        Type mask uses vx,vy,vz and yaw_rate; ignores position, accel, and yaw."""
+        self.master.mav.set_position_target_local_ned_send(
+            0, self.master.target_system, self.master.target_component,
+            mavutil.mavlink.MAV_FRAME_BODY_NED,
+            0b0000011111000111,
+            0, 0, 0,            # position (ignored)
+            vx, vy, vz,         # velocity (forward, right, down)
+            0, 0, 0,            # acceleration (ignored)
+            0, yaw_rate)        # yaw (ignored), yaw_rate
 
     def flight_state(self):
         hb = self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=2)
@@ -320,8 +343,8 @@ class C2Server:
         self.motors = motors
         self.log = log
         self._wp = []
-        self._fly_ready = False        # set by a validated FLY_REQ/prep, consumed by CONFIRM
-        self._mission1_pending = False  # CONFIRM should run Mission 1, not a waypoint flight
+        # A validated flight waiting for CONFIRM: None / "waypoints" / "mission1" / "mission2"
+        self._pending = None
 
     def menu(self):
         return [
@@ -330,6 +353,8 @@ class C2Server:
             {"id": 3, "name": "Fly to waypoints", "needs": "props_on", "gps": True},
             {"id": 4, "name": "Mission 1: hover + detect + land", "needs": "props_on",
              "gps": True, "fly": "mission1"},
+            {"id": 5, "name": "Mission 2: follow person", "needs": "props_on",
+             "gps": True, "fly": "mission2"},
         ]
 
     def _validate(self, mid):
@@ -374,7 +399,7 @@ class C2Server:
             return [p.message(p.ACK, seq, uploaded=up, rejected=rej, note=note)]
         if t == p.FLY_REQ:
             ok, reason = self._validate_fly()
-            self._fly_ready = ok
+            self._pending = "waypoints" if ok else None
             return [p.message(p.ACK, seq, accepted=ok, confirm_required=ok, reason=reason)]
         return []
 
@@ -399,13 +424,18 @@ class C2Server:
             self.log(f"RUN {mid} rejected: {reason}")
             return
         item = next((i for i in self.menu() if i["id"] == mid), {})
-        if item.get("fly") == "mission1":
-            self._mission1_pending = True
-            self._fly_ready = True
-            send(p.message(p.ACK, seq, id=mid, accepted=True, confirm_required=True,
-                           reason="Mission 1: takeoff to {:g} m, hover {:d} s + detect people, "
-                                  "land in place. Confirm to launch.".format(HOVER_ALT_M, int(HOVER_TIME_S))))
-            self.log("Mission 1 prepared — awaiting CONFIRM")
+        fly = item.get("fly")
+        if fly in ("mission1", "mission2"):
+            self._pending = fly
+            if fly == "mission1":
+                reason = ("Mission 1: takeoff to {:g} m, hover {:d} s + detect people, "
+                          "land in place. Confirm to launch.".format(HOVER_ALT_M, int(HOVER_TIME_S)))
+            else:
+                reason = ("Mission 2: takeoff to {:g} m, then FOLLOW the person "
+                          "(keep {:g} m). Send STOP to land. Confirm to launch.".format(
+                              HOVER_ALT_M, FOLLOW_DIST_M))
+            send(p.message(p.ACK, seq, id=mid, accepted=True, confirm_required=True, reason=reason))
+            self.log(f"{fly} prepared — awaiting CONFIRM")
             return
         send(p.message(p.ACK, seq, id=mid, accepted=True, reason=reason))
         self.log(f"RUN {mid} accepted — executing")
@@ -446,11 +476,10 @@ class C2Server:
     def run_mission1(self, link, send):
         """Mission 1: arm -> takeoff -> hover HOVER_TIME_S while reporting detected
         people -> land in place. Same link-loss RTL / abort failsafes as run_flight."""
-        self._mission1_pending = False
-        if not self._fly_ready:
+        if self._pending != "mission1":
             send(p.message(p.ACK, 0, accepted=False, reason="no confirmed flight pending"))
             return
-        self._fly_ready = False
+        self._pending = None
         cam = self._open_camera()
 
         send(p.message(p.LOG, 0, text="Mission 1: arming"))
@@ -531,14 +560,125 @@ class C2Server:
         self.fc.set_flight_mode("RTL")
         send(p.message(p.DONE, 0, id="mission1", result="time cap -> RTL"))
 
+    @staticmethod
+    def _follow_setpoint(person):
+        """person X (right+)/Z (forward dist) -> (vx forward, yaw_rate). vz=0 (hold alt)."""
+        z = person.get("z", FOLLOW_DIST_M)
+        x = person.get("x", 0.0)
+        vx = 0.0
+        if z > FOLLOW_DIST_M + FOLLOW_DIST_DEAD:
+            vx = FOLLOW_FWD_MPS
+        elif z < FOLLOW_DIST_M - FOLLOW_DIST_DEAD:
+            vx = -FOLLOW_FWD_MPS
+        yaw = 0.0
+        if x > FOLLOW_X_DEAD:
+            yaw = FOLLOW_YAW_RPS
+        elif x < -FOLLOW_X_DEAD:
+            yaw = -FOLLOW_YAW_RPS
+        return vx, yaw
+
+    def run_mission2(self, link, send):
+        """Mission 2: arm -> takeoff -> OFFBOARD follow the person, keeping
+        FOLLOW_DIST_M, until the client sends STOP (land) / ABORT (RTL) / link loss
+        (RTL). No person in view -> hover in place (never drift)."""
+        if self._pending != "mission2":
+            send(p.message(p.ACK, 0, accepted=False, reason="no confirmed flight pending"))
+            return
+        self._pending = None
+        cam = self._open_camera()
+
+        send(p.message(p.LOG, 0, text="Mission 2: arming"))
+        self.log("MISSION2: arming")
+        try:
+            if not self.fc.arm():
+                send(p.message(p.DONE, 0, id="mission2", result="FAILED: arm rejected"))
+                return
+            send(p.message(p.LOG, 0, text="armed — takeoff to {:g} m".format(HOVER_ALT_M)))
+            self.fc.set_flight_mode("TAKEOFF")
+        except Exception as exc:
+            send(p.message(p.DONE, 0, id="mission2", result=f"FAILED: {exc}"))
+            return
+
+        last_ping = time.time()
+        last_status = 0.0
+        rtl = False
+        ending = None            # None -> flying; "STOP"/"ABORT"/"LINKLOSS"
+        offboard = False
+        last_person_t = 0.0
+        deadline = time.time() + FLIGHT_MAX_S
+        while time.time() < deadline:
+            now = time.time()
+            msg = link.poll()
+            if msg:
+                mt = msg.get("t")
+                if mt == p.PING:
+                    last_ping = now
+                    send(p.message(p.PONG, msg.get("seq", 0)))
+                elif mt == p.STOP and ending is None:
+                    ending = "STOP"
+                    send(p.message(p.LOG, 0, text="STOP — landing in place"))
+                    self.fc.set_flight_mode("LAND")
+                elif mt == p.ABORT and ending is None:
+                    ending, rtl = "ABORT", True
+                    send(p.message(p.LOG, 0, text="ABORT — returning home"))
+                    self.fc.set_flight_mode("RTL")
+            if ending is None and now - last_ping > LINK_LOSS_S:
+                ending, rtl = "LINKLOSS", True
+                self.log("MISSION2: LINK LOST -> RTL")
+                send(p.message(p.LOG, 0, text="LINK LOST — returning home"))
+                self.fc.set_flight_mode("RTL")
+
+            st = self.fc.flight_state()
+            person = self._read_person(cam)
+            following = False
+            if ending is None:
+                # once at altitude, enter OFFBOARD and stream velocity setpoints
+                if not offboard and st["alt"] >= HOVER_ALT_M * 0.9:
+                    for _ in range(10):
+                        self.fc.send_velocity(0, 0, 0, 0)
+                        time.sleep(0.02)
+                    self.fc.set_flight_mode("OFFBOARD")
+                    offboard = True
+                    send(p.message(p.LOG, 0, text="following — send STOP to land"))
+                if offboard:
+                    if person is not None:
+                        last_person_t = now
+                        vx, yaw = self._follow_setpoint(person)
+                        following = True
+                    else:
+                        vx, yaw = 0.0, 0.0        # no person -> hover, don't drift
+                    self.fc.send_velocity(vx, 0, 0, yaw)
+
+            if now - last_status >= STATUS_INTERVAL_S:
+                send(p.message(p.STATUS, 0, rtl=rtl,
+                               phase=("RTL" if rtl else (ending or ("follow" if offboard else "takeoff"))),
+                               person=person is not None, following=following,
+                               pz=round(person["z"], 2) if person else None, **st))
+                last_status = now
+
+            if not st["armed"]:
+                if cam:
+                    cam.close()
+                how = {"STOP": "landed (stopped)", "ABORT": "landed (RTL)",
+                       "LINKLOSS": "landed (link-loss RTL)"}.get(ending, "landed & disarmed")
+                send(p.message(p.DONE, 0, id="mission2", result=how))
+                self.log("MISSION2: landed & disarmed")
+                return
+            time.sleep(0.1)
+
+        if cam:
+            cam.close()
+        self.fc.set_flight_mode("RTL")
+        send(p.message(p.DONE, 0, id="mission2", result="time cap -> RTL"))
+
     def run_flight(self, link, send):
         """CONFIRM received: arm + AUTO.MISSION, then monitor with a link-loss
         RTL failsafe until the drone lands and disarms. `link` is polled for the
         client's in-flight pings and ABORT; `send` pushes status/log back."""
-        if not self._fly_ready:
+        if self._pending != "waypoints":
             send(p.message(p.ACK, 0, accepted=False, reason="no confirmed flight pending"))
             return
-        self._fly_ready = False
+        self._pending = None
 
         send(p.message(p.LOG, 0, text="arming..."))
         self.log("FLIGHT: arming")
@@ -637,8 +777,10 @@ def serve(server, link, log=print):
         if t == p.RUN:
             server.run_and_report(msg, link.send)
         elif t == p.CONFIRM:
-            if server._mission1_pending:
+            if server._pending == "mission1":
                 server.run_mission1(link, link.send)
+            elif server._pending == "mission2":
+                server.run_mission2(link, link.send)
             else:
                 server.run_flight(link, link.send)
         else:

@@ -25,11 +25,12 @@ WP        = "WP"         # client -> jetson : one waypoint {i,lat,lon,alt}
 WP_END    = "WP_END"     # client -> jetson : end of waypoint upload
 PING      = "PING"       # either way : liveness check
 PONG      = "PONG"       # either way : liveness reply
-ABORT     = "ABORT"      # client -> jetson : stop current mission / RTL now
+ABORT     = "ABORT"      # client -> jetson : emergency — return home (RTL) now
 LOG       = "LOG"        # jetson -> client : a text line to show
 STATUS    = "STATUS"     # jetson -> client : lite status (armed, alt, mode)
 FLY_REQ   = "FLY_REQ"    # client -> jetson : request to arm + fly uploaded mission
 CONFIRM   = "CONFIRM"    # client -> jetson : second step — confirm arm + launch
+STOP      = "STOP"       # client -> jetson : end following normally -> land in place
 
 
 def encode(m: dict) -> str:
