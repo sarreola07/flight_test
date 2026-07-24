@@ -1,6 +1,11 @@
 [Unit]
 Description=Venator C2 server — LoRa command link to the drone
-After=multi-user.target
+# Do NOT wait for multi-user.target: on this Jetson, snapd.seeded.service stalls
+# it for ~2 min at boot. We only need the USB ports (which come up early) and we
+# retry until the Pixhawk is ready, so start as soon as the filesystem is up.
+After=local-fs.target
+# Never give up restarting while it waits for the ports / Pixhawk to appear.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
