@@ -17,12 +17,26 @@ rejected unless props are declared ON (--props-on) and the FC's own checks pass
 (e.g. a GPS fix). Motor tests require props OFF. Nothing arms on startup.
 """
 import argparse
+import glob
 import sys
 import time
 
 import c2_protocol as p
 
 MAX_ALT_M = 50.0   # reject uploaded waypoints above this relative altitude
+
+
+def find_fc_device(default="/dev/ttyACM0"):
+    """Locate the Pixhawk robustly, so a USB replug (ttyACM0->ttyACM1) can't
+    break the link. Prefer the stable by-id symlink (survives renumbering and
+    the v2->v3 reflash, since the name still contains PX4/FMU), then any ttyACM."""
+    for pat in ("/dev/serial/by-id/*PX4*", "/dev/serial/by-id/*FMU*",
+                "/dev/serial/by-id/*Pixhawk*"):
+        matches = sorted(glob.glob(pat))
+        if matches:
+            return matches[0]
+    acms = sorted(glob.glob("/dev/ttyACM*"))
+    return acms[0] if acms else default
 
 # Reuse the tested mission logic and MAVLink helpers from missions.py
 try:
@@ -322,7 +336,8 @@ def main():
     ap = argparse.ArgumentParser(description="Venator Jetson C2 server")
     ap.add_argument("--lora-port", default="/dev/ttyUSB0")
     ap.add_argument("--lora-baud", type=int, default=115200)
-    ap.add_argument("--fc-device", default="/dev/ttyACM0")
+    ap.add_argument("--fc-device", default="auto",
+                    help="Pixhawk serial port, or 'auto' to detect by stable ID")
     ap.add_argument("--fc-baud", type=int, default=115200)
     ap.add_argument("--motors", type=int, default=6)
     ap.add_argument("--real", action="store_true",
@@ -340,7 +355,9 @@ def main():
     if args.real:
         if missions is None:
             sys.exit("pymavlink/missions unavailable — run with the venv, or drop --real")
-        fc = RealFC(args.fc_device, args.fc_baud)
+        device = find_fc_device() if args.fc_device == "auto" else args.fc_device
+        print("FC device: {}".format(device), flush=True)
+        fc = RealFC(device, args.fc_baud)
     else:
         fc = MockFC()
 
