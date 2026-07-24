@@ -23,7 +23,10 @@ import time
 
 import c2_protocol as p
 
-MAX_ALT_M = 50.0   # reject uploaded waypoints above this relative altitude
+MAX_ALT_M = 50.0        # reject uploaded waypoints above this relative altitude
+LINK_LOSS_S = 4.0       # in flight, no client ping for this long -> RTL failsafe
+FLIGHT_MAX_S = 600.0    # hard cap on a monitored flight -> RTL
+STATUS_INTERVAL_S = 1.0 # how often to push in-flight status to the client
 
 
 def find_fc_device(default="/dev/ttyACM0"):
@@ -51,21 +54,71 @@ except ImportError:
 # Flight-controller abstraction — mock (safe) or real (pymavlink via missions).
 # --------------------------------------------------------------------------
 class MockFC:
-    """A fake flight controller so the server runs and is testable with no drone."""
+    """A fake flight controller so the server runs and is testable with no drone.
+
+    Includes a tiny flight simulator (arm -> climb -> hover -> land/RTL -> disarm)
+    so the flight trigger and link-loss failsafe can be exercised without a drone.
+    Pass gps=True to simulate a 3D fix (needed to test the flight path).
+    """
     name = "mock"
 
+    def __init__(self, gps=False):
+        self._gps = gps
+        self._armed = False
+        self._mode = "HOLD"
+        self._t_arm = 0.0
+        self._t_land = None
+        self._has_mission = False
+
     def status(self):
-        return {"armed": False, "gps": "no fix", "batt": 11.4}
+        return {"armed": self._armed, "gps": "3D fix" if self._gps else "no fix", "batt": 11.4}
 
     def has_gps_fix(self):
-        return False
+        return self._gps
 
     def run_mission(self, mid, motors=6):
         time.sleep(0.1)
         return True, "ok (mock)"
 
     def upload_waypoints(self, wps):
-        return len(wps), 0, "stored (mock — no GPS, would not fly)"
+        self._has_mission = len(wps) > 0
+        return len(wps), 0, "stored (mock)"
+
+    def has_mission(self):
+        return self._has_mission
+
+    # -- flight simulation --
+    def arm(self, timeout=8):
+        self._armed = True
+        self._t_arm = time.time()
+        self._t_land = None
+        return True
+
+    def disarm(self):
+        self._armed = False
+        return True
+
+    def set_flight_mode(self, mode):
+        self._mode = mode
+        if mode in ("LAND", "RTL") and self._t_land is None:
+            self._t_land = time.time()
+        return True
+
+    def flight_state(self):
+        now = time.time()
+        # simulate the mission finishing (auto RTL+land) ~4 s after takeoff
+        if self._armed and self._t_land is None and now - self._t_arm > 4.0:
+            self._t_land = now
+        # simulate touchdown + auto-disarm ~1.5 s after landing starts
+        if self._armed and self._t_land and now - self._t_land > 1.5:
+            self._armed = False
+        if not self._armed:
+            return {"armed": False, "alt": 0.0, "mode": self._mode}
+        if self._t_land:
+            alt = max(0.0, 1.5 - (now - self._t_land)) * 2.0
+        else:
+            alt = min(3.0, (now - self._t_arm) * 1.5)  # climb to 3 m
+        return {"armed": True, "alt": round(alt, 2), "mode": self._mode}
 
     def close(self):
         pass
@@ -97,6 +150,46 @@ class RealFC:
     def has_gps_fix(self):
         g = self.master.recv_match(type="GPS_RAW_INT", blocking=True, timeout=2)
         return bool(g and g.fix_type >= 3)
+
+    def has_mission(self):
+        self.master.mav.mission_request_list_send(
+            self.master.target_system, self.master.target_component,
+            mavutil.mavlink.MAV_MISSION_TYPE_MISSION)
+        c = self.master.recv_match(type="MISSION_COUNT", blocking=True, timeout=3)
+        return bool(c and c.count > 0)
+
+    # -- flight --
+    def arm(self, timeout=8):
+        self.master.mav.command_long_send(
+            self.master.target_system, self.master.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
+        end = time.time() + timeout
+        while time.time() < end:
+            hb = self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
+            if hb and (hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
+                return True
+        return False
+
+    def disarm(self):
+        self.master.mav.command_long_send(
+            self.master.target_system, self.master.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0)
+        return True
+
+    def set_flight_mode(self, mode):
+        # mode is a px4_map key: "MISSION", "RTL", "LAND", "TAKEOFF"
+        self.master.set_mode_px4(*mavutil.px4_map[mode])
+        return True
+
+    def flight_state(self):
+        hb = self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=2)
+        armed = bool(hb and (hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED))
+        mode = mavutil.mode_string_v10(hb) if hb else "?"
+        alt = 0.0
+        g = self.master.recv_match(type="GLOBAL_POSITION_INT", blocking=False)
+        if g:
+            alt = round(g.relative_alt / 1000.0, 2)
+        return {"armed": armed, "alt": alt, "mode": mode}
 
     def run_mission(self, mid, motors=6):
         if mid == 1:
@@ -216,6 +309,7 @@ class C2Server:
         self.motors = motors
         self.log = log
         self._wp = []
+        self._fly_ready = False   # set by a validated FLY_REQ, consumed by CONFIRM
 
     def menu(self):
         return [
@@ -265,7 +359,21 @@ class C2Server:
         if t == p.WP_END:
             up, rej, note = self.fc.upload_waypoints(self._wp)
             return [p.message(p.ACK, seq, uploaded=up, rejected=rej, note=note)]
+        if t == p.FLY_REQ:
+            ok, reason = self._validate_fly()
+            self._fly_ready = ok
+            return [p.message(p.ACK, seq, accepted=ok, confirm_required=ok, reason=reason)]
         return []
+
+    def _validate_fly(self):
+        """Safety gate for arming and flying the uploaded mission."""
+        if self.props_off:
+            return False, "props are OFF — flight needs props ON"
+        if not self.fc.has_gps_fix():
+            return False, "no GPS 3D fix"
+        if not self.fc.has_mission():
+            return False, "no mission uploaded — send waypoints first"
+        return True, "ready — arm + fly takeoff->waypoints->RTL"
 
     def run_and_report(self, msg, send):
         """Handle a RUN: ACK, execute (blocking), then DONE — via send(msg)."""
@@ -282,6 +390,66 @@ class C2Server:
         except Exception as exc:
             ok, result = False, f"error: {exc}"
         send(p.message(p.DONE, seq, id=mid, result=result if ok else f"FAILED: {result}"))
+
+    def run_flight(self, link, send):
+        """CONFIRM received: arm + AUTO.MISSION, then monitor with a link-loss
+        RTL failsafe until the drone lands and disarms. `link` is polled for the
+        client's in-flight pings and ABORT; `send` pushes status/log back."""
+        if not self._fly_ready:
+            send(p.message(p.ACK, 0, accepted=False, reason="no confirmed flight pending"))
+            return
+        self._fly_ready = False
+
+        send(p.message(p.LOG, 0, text="arming..."))
+        self.log("FLIGHT: arming")
+        try:
+            if not self.fc.arm():
+                send(p.message(p.DONE, 0, id="fly", result="FAILED: arm rejected (pre-arm checks)"))
+                return
+            send(p.message(p.LOG, 0, text="armed — AUTO.MISSION, taking off"))
+            self.log("FLIGHT: armed, AUTO.MISSION")
+            self.fc.set_flight_mode("MISSION")
+        except Exception as exc:
+            send(p.message(p.DONE, 0, id="fly", result=f"FAILED: {exc}"))
+            return
+
+        last_ping = time.time()
+        last_status = 0.0
+        rtl = False
+        deadline = time.time() + FLIGHT_MAX_S
+        while time.time() < deadline:
+            now = time.time()
+            msg = link.poll()
+            if msg:
+                mt = msg.get("t")
+                if mt == p.PING:
+                    last_ping = now
+                    send(p.message(p.PONG, msg.get("seq", 0)))
+                elif mt == p.ABORT and not rtl:
+                    self.log("FLIGHT: ABORT -> RTL")
+                    send(p.message(p.LOG, 0, text="ABORT — returning home"))
+                    self.fc.set_flight_mode("RTL")
+                    rtl = True
+            if not rtl and now - last_ping > LINK_LOSS_S:
+                self.log("FLIGHT: LINK LOST -> RTL")
+                send(p.message(p.LOG, 0, text="LINK LOST — returning home"))
+                self.fc.set_flight_mode("RTL")
+                rtl = True
+
+            st = self.fc.flight_state()
+            if now - last_status >= STATUS_INTERVAL_S:
+                send(p.message(p.STATUS, 0, rtl=rtl, **st))
+                last_status = now
+            if not st["armed"]:
+                send(p.message(p.DONE, 0, id="fly",
+                               result="landed & disarmed" + (" (RTL)" if rtl else "")))
+                self.log("FLIGHT: landed & disarmed")
+                return
+            time.sleep(0.15)
+
+        self.log("FLIGHT: time cap reached -> RTL")
+        self.fc.set_flight_mode("RTL")
+        send(p.message(p.DONE, 0, id="fly", result="flight time cap -> RTL"))
 
 
 # --------------------------------------------------------------------------
@@ -325,8 +493,11 @@ def serve(server, link, log=print):
         if msg is None:
             time.sleep(0.02)
             continue
-        if msg.get("t") == p.RUN:
+        t = msg.get("t")
+        if t == p.RUN:
             server.run_and_report(msg, link.send)
+        elif t == p.CONFIRM:
+            server.run_flight(link, link.send)
         else:
             for reply in server.handle(msg):
                 link.send(reply)

@@ -119,6 +119,8 @@ class MockJetson:
             n = len(getattr(self, "_wp", []))
             return [p.message(p.ACK, seq, uploaded=n, rejected=0,
                               note="stored (mock — no GPS, would not fly)")]
+        if t == p.FLY_REQ:
+            return [p.message(p.ACK, seq, accepted=False, reason="no GPS fix (mock)")]
         return []
 
 
@@ -222,9 +224,65 @@ class Client:
         for i, (lat, lon, alt) in enumerate(wps):
             self.request(p.message(p.WP, self._next_seq(), i=i, lat=lat, lon=lon, alt=alt), {p.ACK})
         r = self.request(p.message(p.WP_END, self._next_seq()), {p.ACK})
-        if r:
-            print(f"{C_OK}Upload result:{C_OFF} {r.get('uploaded')} stored, "
-                  f"{r.get('rejected')} rejected. {r.get('note','')}")
+        if not r or not r.get("uploaded"):
+            print(f"{C_ERR}Upload failed:{C_OFF} {r.get('note','') if r else 'no response'}")
+            return
+        print(f"{C_OK}Upload result:{C_OFF} {r.get('uploaded')} stored, "
+              f"{r.get('rejected')} rejected. {r.get('note','')}")
+        self.fly_uploaded_mission()
+
+    def fly_uploaded_mission(self):
+        """Two-step arm+fly of the uploaded mission, then monitor the flight."""
+        if input("\nArm and FLY this mission now? (type FLY, else skip): ").strip().lower() != "fly":
+            print("Mission stored on the drone; not flying now.")
+            return
+        # step 1 — ask the drone if it's safe to fly
+        ack = self.request(p.message(p.FLY_REQ, self._next_seq()), {p.ACK}, timeout=8)
+        if not ack or not ack.get("accepted"):
+            print(f"{C_WARN}Cannot fly: {ack.get('reason') if ack else 'no response'}{C_OFF}")
+            return
+        # step 2 — explicit second confirmation
+        print(f"{C_WARN}SAFETY: {ack.get('reason')}{C_OFF}")
+        print(f"{C_WARN}The drone will ARM and TAKE OFF. Ctrl-C during flight = abort (return home).{C_OFF}")
+        if input("Type LAUNCH to arm and take off: ").strip().lower() != "launch":
+            print("Aborted — not flying.")
+            return
+        self.tx.send(p.message(p.CONFIRM, self._next_seq()))
+        self.monitor_flight()
+
+    def monitor_flight(self):
+        """Send flight heartbeats, show live status, Ctrl-C to abort (RTL)."""
+        print(f"{C_OK}Launch confirmed.{C_OFF} Monitoring flight — Ctrl-C to abort (return home).")
+        last_ping = 0.0
+        try:
+            while True:
+                now = time.time()
+                if now - last_ping > 1.0:
+                    self.tx.send(p.message(p.PING, self._next_seq()))
+                    last_ping = now
+                r = self.tx.poll()
+                if r is None:
+                    time.sleep(0.05)
+                    continue
+                t = r.get("t")
+                if t == p.STATUS:
+                    tag = "  [RTL]" if r.get("rtl") else ""
+                    print(f"{C_OK}alt {r.get('alt')} m  mode {r.get('mode')}  armed {r.get('armed')}{tag}{C_OFF}")
+                elif t == p.LOG:
+                    print(f"{C_DIM}  drone: {r.get('text','')}{C_OFF}")
+                elif t == p.DONE:
+                    print(f"{C_OK}Flight complete:{C_OFF} {r.get('result','')}")
+                    return
+        except KeyboardInterrupt:
+            print(f"\n{C_WARN}ABORT — telling the drone to return home...{C_OFF}")
+            self.tx.send(p.message(p.ABORT, self._next_seq()))
+            end = time.time() + 90
+            while time.time() < end:
+                r = self.tx.poll()
+                if r and r.get("t") == p.DONE:
+                    print(f"{C_OK}Flight complete:{C_OFF} {r.get('result','')}")
+                    return
+                time.sleep(0.1)
 
 
 def flag_label(item):

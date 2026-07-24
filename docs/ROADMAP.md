@@ -12,7 +12,7 @@ the Jetson**, including a "fly to these coordinates" mission.
 | 2 | Portable laptop client + mock + CI to build `.exe`/`.app` | 🔵 in progress |
 | 3 | Bidirectional Heltec firmware (half-duplex transceiver) | ✅ written — you flash + two-terminal test |
 | 4 | Jetson C2 server + systemd boot service (zero-touch) | ✅ working over real LoRa (motor test); boot service + rich menu done |
-| 5 | GPS + waypoint flight | 🔵 M8N installed; upload built & bench-tested (PX4 accepts); flight trigger + outdoor fix pending |
+| 5 | GPS + waypoint flight | 🔵 upload + flight trigger + two-step arm + link-loss RTL built & bench-tested; real outdoor flight pending a fix |
 | 6 | Polish: auto-launch agents, saved "places", browser GUI, OFFBOARD follow | ⬜ |
 
 ## Phase details
