@@ -788,6 +788,44 @@ def serve(server, link, log=print):
                 link.send(reply)
 
 
+def wait_for_fc(link, args):
+    """Retry the Pixhawk connection forever. While it's missing, keep answering
+    the LoRa link so the operator sees WHY the drone isn't ready (instead of
+    silence when the Pixhawk USB is unplugged or still booting)."""
+    last_note = 0.0
+    while True:
+        device = find_fc_device() if args.fc_device == "auto" else args.fc_device
+        try:
+            print("FC device: {}".format(device), flush=True)
+            return RealFC(device, args.fc_baud)
+        except SystemExit:
+            pass  # missions.connect() exits on no-heartbeat; treat as retry
+        except Exception as exc:
+            print("FC connect failed: {}".format(exc), flush=True)
+        if time.time() - last_note > 30:
+            print("Pixhawk not connected — retrying every 5 s...", flush=True)
+            last_note = time.time()
+        end = time.time() + 5
+        while time.time() < end:
+            msg = link.poll()
+            if msg is None:
+                time.sleep(0.05)
+                continue
+            t = msg.get("t")
+            seq = msg.get("seq", 0)
+            if t == p.HELLO:
+                link.send(p.message(p.HELLO_ACK, seq, proto=p.PROTO_VERSION,
+                                    fc="disconnected", props_off=True,
+                                    armed=False, gps="n/a", batt=0))
+                link.send(p.message(p.LOG, 0,
+                                    text="Pixhawk NOT connected to the Jetson — check its USB cable"))
+            elif t == p.PING:
+                link.send(p.message(p.PONG, seq))
+            elif t == p.GET_MENU:
+                link.send(p.message(p.MENU, seq, item=None, last=True))
+                link.send(p.message(p.LOG, 0, text="no missions — Pixhawk not connected"))
+
+
 def main():
     ap = argparse.ArgumentParser(description="Venator Jetson C2 server")
     ap.add_argument("--lora-port", default="/dev/ttyUSB0")
@@ -808,21 +846,21 @@ def main():
     except (AttributeError, OSError):
         pass
 
-    if args.real:
-        if missions is None:
-            sys.exit("pymavlink/missions unavailable — run with the venv, or drop --real")
-        device = find_fc_device() if args.fc_device == "auto" else args.fc_device
-        print("FC device: {}".format(device), flush=True)
-        fc = RealFC(device, args.fc_baud)
-    else:
-        fc = MockFC()
-
-    server = C2Server(fc, props_off=not args.props_on, motors=args.motors)
-
+    # Open the LoRa link FIRST so the operator gets answers even when the
+    # flight controller is missing (previously this crash-looped in silence).
     try:
         link = LoRaLink(args.lora_port, args.lora_baud)
     except Exception as e:
         sys.exit(f"Could not open LoRa port {args.lora_port}: {e}")
+
+    if args.real:
+        if missions is None:
+            sys.exit("pymavlink/missions unavailable — run with the venv, or drop --real")
+        fc = wait_for_fc(link, args)
+    else:
+        fc = MockFC()
+
+    server = C2Server(fc, props_off=not args.props_on, motors=args.motors)
 
     try:
         serve(server, link)
