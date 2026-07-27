@@ -10,11 +10,13 @@ The laptop never touches the drone directly — it only speaks the protocol.
     python3 jetson_c2_server.py
 
     # real: connect the Pixhawk and actually run missions
-    ./venv/bin/python jetson_c2_server.py --real --props-on
+    ./venv/bin/python jetson_c2_server.py --real
 
-Safety: defaults to a MOCK flight controller and props-OFF. Flight missions are
-rejected unless props are declared ON (--props-on) and the FC's own checks pass
-(e.g. a GPS fix). Motor tests require props OFF. Nothing arms on startup.
+Safety: defaults to a MOCK flight controller (--real for the Pixhawk). Props are
+assumed ON, since in flight testing they stay fitted and the operator can't reach
+the Jetson from the field; that means motor tests are refused until props are
+declared OFF (menu "Toggle props state", or --props-off). Flight additionally
+requires the FC's own checks to pass (GPS fix, pre-arm). Nothing arms on startup.
 """
 import argparse
 import glob
@@ -116,6 +118,12 @@ class MockFC:
         return self._has_mission
 
     # -- flight simulation --
+    arm_detail = ""
+
+    def diagnostics(self):
+        return ("gps 3D/9sat | batt 11.4V | sensors OK" if self._gps
+                else "gps noGPS/0sat | batt 11.4V | sensors OK")
+
     def arm(self, timeout=8):
         self._armed = True
         self._t_arm = time.time()
@@ -202,16 +210,55 @@ class RealFC:
 
     # -- flight --
     def arm(self, timeout=8):
+        """Arm, capturing PX4's own refusal text so the operator can diagnose a
+        failed arm from the laptop alone (no monitor at the drone in the field)."""
+        self.arm_detail = ""
+        notes = []
         self.master.mav.command_long_send(
             self.master.target_system, self.master.target_component,
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
         end = time.time() + timeout
         while time.time() < end:
-            hb = self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
-            if hb and (hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
+            m = self.master.recv_match(
+                type=["HEARTBEAT", "COMMAND_ACK", "STATUSTEXT"], blocking=True, timeout=1)
+            if m is None:
+                continue
+            t = m.get_type()
+            if t == "STATUSTEXT":
+                txt = (m.text or "").strip()
+                if txt and txt not in notes:
+                    notes.append(txt)
+            elif t == "COMMAND_ACK" and m.command == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
+                if m.result != mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                    res = mavutil.mavlink.enums["MAV_RESULT"].get(m.result)
+                    notes.append(res.name if res else f"result {m.result}")
+            elif t == "HEARTBEAT" and (m.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
                 self._armed = True      # seed the cache before the flight loop runs
                 return True
+        # keep it short: it has to fit one LoRa packet
+        self.arm_detail = " | ".join(notes[-2:])[:120] or "no reason reported by PX4"
         return False
+
+    def diagnostics(self):
+        """Compact pre-flight readout for the laptop (fits one LoRa packet)."""
+        bits = []
+        g = self.master.recv_match(type="GPS_RAW_INT", blocking=True, timeout=3)
+        if g:
+            fixes = {0: "noGPS", 1: "nofix", 2: "2D", 3: "3D", 4: "DGPS", 5: "RTK"}
+            bits.append(f"gps {fixes.get(g.fix_type, g.fix_type)}/{g.satellites_visible}sat")
+        s = self.master.recv_match(type="SYS_STATUS", blocking=True, timeout=3)
+        if s:
+            v = s.voltage_battery / 1000.0
+            bits.append(f"batt {'n/a' if s.voltage_battery == 65535 else f'{v:.1f}V'}")
+            unhealthy = []
+            for bit, e in mavutil.mavlink.enums["MAV_SYS_STATUS_SENSOR"].items():
+                if bit and (s.onboard_control_sensors_present & bit) \
+                        and (s.onboard_control_sensors_enabled & bit) \
+                        and not (s.onboard_control_sensors_health & bit):
+                    unhealthy.append(e.name.replace("MAV_SYS_STATUS_SENSOR_", "")
+                                     .replace("MAV_SYS_STATUS_", "")[:12])
+            bits.append("bad: " + ",".join(unhealthy[:3]) if unhealthy else "sensors OK")
+        return " | ".join(bits)[:170] or "no telemetry"
 
     def disarm(self):
         self.master.mav.command_long_send(
@@ -397,6 +444,10 @@ class C2Server:
             # operator can't reach from the field (LoRa menu = numbers only).
             {"id": 6, "name": "Toggle props state (now {})".format(
                 "OFF" if self.props_off else "ON"), "action": "toggle_props"},
+            # Field diagnostics: with no monitor at the drone, this is how the
+            # operator checks GPS/battery/sensor readiness from the laptop.
+            {"id": 7, "name": "Drone status (GPS / battery / sensors)",
+             "action": "diagnostics"},
         ]
 
     def _validate(self, mid):
@@ -466,6 +517,15 @@ class C2Server:
 
         # Runtime actions (no props/GPS gate) — handled before validation.
         item0 = next((i for i in self.menu() if i["id"] == mid), {})
+        if item0.get("action") == "diagnostics":
+            try:
+                text = self.fc.diagnostics()
+            except Exception as exc:
+                text = f"error reading telemetry: {exc}"
+            self.log(f"diagnostics: {text}")
+            send(p.message(p.ACK, seq, id=mid, accepted=True, reason="reading telemetry"))
+            send(p.message(p.DONE, seq, id=mid, result=text))
+            return
         if item0.get("action") == "toggle_props":
             self.props_off = not self.props_off
             state = "OFF" if self.props_off else "ON"
@@ -545,7 +605,9 @@ class C2Server:
         self.log("MISSION1: arming")
         try:
             if not self.fc.arm():
-                send(p.message(p.DONE, 0, id="mission1", result="FAILED: arm rejected"))
+                why = getattr(self.fc, "arm_detail", "") or "no reason reported"
+                send(p.message(p.LOG, 0, text="PX4 refused to arm: " + why))
+                send(p.message(p.DONE, 0, id="mission1", result="FAILED: arm rejected — " + why))
                 return
             send(p.message(p.LOG, 0, text="armed — takeoff to {:g} m".format(HOVER_ALT_M)))
             # AUTO.TAKEOFF climbs to MIS_TAKEOFF_ALT, so set it or PX4 uses its
@@ -653,7 +715,9 @@ class C2Server:
         self.log("MISSION2: arming")
         try:
             if not self.fc.arm():
-                send(p.message(p.DONE, 0, id="mission2", result="FAILED: arm rejected"))
+                why = getattr(self.fc, "arm_detail", "") or "no reason reported"
+                send(p.message(p.LOG, 0, text="PX4 refused to arm: " + why))
+                send(p.message(p.DONE, 0, id="mission2", result="FAILED: arm rejected — " + why))
                 return
             send(p.message(p.LOG, 0, text="armed — takeoff to {:g} m".format(HOVER_ALT_M)))
             # AUTO.TAKEOFF climbs to MIS_TAKEOFF_ALT, so set it or PX4 uses its
@@ -749,7 +813,9 @@ class C2Server:
         self.log("FLIGHT: arming")
         try:
             if not self.fc.arm():
-                send(p.message(p.DONE, 0, id="fly", result="FAILED: arm rejected (pre-arm checks)"))
+                why = getattr(self.fc, "arm_detail", "") or "no reason reported"
+                send(p.message(p.LOG, 0, text="PX4 refused to arm: " + why))
+                send(p.message(p.DONE, 0, id="fly", result="FAILED: arm rejected — " + why))
                 return
             send(p.message(p.LOG, 0, text="armed — AUTO.MISSION, taking off"))
             self.log("FLIGHT: armed, AUTO.MISSION")
