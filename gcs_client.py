@@ -178,20 +178,34 @@ class Client:
 
     def get_menu(self):
         # The menu is streamed one item per packet (each fits a LoRa frame), so
-        # collect MENU messages until the one flagged last.
+        # collect MENU messages until the one flagged last. LoRa is lossy, so
+        # accept only well-formed items and de-duplicate by id — a corrupted
+        # packet must never crash the client or show a bogus mission.
         self.tx.send(p.message(p.GET_MENU, self._next_seq()))
-        items = []
+        items, seen = [], set()
+        dropped = 0
         end = time.time() + 8
         while time.time() < end:
             r = self.tx.poll()
             if r is None:
                 time.sleep(0.02)
                 continue
-            if r.get("t") == p.MENU:
-                if r.get("item"):
-                    items.append(r["item"])
-                if r.get("last"):
-                    break
+            if r.get("t") != p.MENU:
+                continue
+            it = r.get("item")
+            if isinstance(it, dict):
+                if isinstance(it.get("id"), int) and isinstance(it.get("name"), str):
+                    if it["id"] not in seen:
+                        seen.add(it["id"])
+                        items.append(it)
+                else:
+                    dropped += 1
+            if r.get("last"):
+                break
+        if dropped:
+            print(f"{C_WARN}({dropped} menu packet(s) arrived corrupted and were "
+                  f"ignored — pick 'r' to refresh){C_OFF}")
+        items.sort(key=lambda i: i["id"])
         return items
 
     def run_mission(self, mid):
@@ -386,27 +400,47 @@ def menu_loop(client):
     while True:
         print("\n=== Missions ===")
         for it in items:
-            print(f"  {it['id']}) {it['name']}{flag_label(it)}")
-        print("  q) Quit")
+            # .get() everywhere: never let odd remote data crash the client
+            print(f"  {it.get('id','?')}) {it.get('name','(unnamed)')}{flag_label(it)}")
+        print("  r) Refresh menu     q) Quit")
         choice = input("\nSelect: ").strip().lower()
         if choice == "q":
             print("Bye.")
             return
+        if choice == "r":
+            fresh = client.get_menu()
+            if fresh:
+                items = fresh
+            else:
+                print(f"{C_WARN}No menu received — the drone may be out of range.{C_OFF}")
+            continue
         if not choice.isdigit():
             print("Enter a number or q."); continue
         mid = int(choice)
-        item = next((i for i in items if i["id"] == mid), None)
+        item = next((i for i in items if i.get("id") == mid), None)
         if item is None:
             print("No such mission."); continue
-        name = item["name"].lower()
-        if name.startswith("fly to waypoints"):
-            client.upload_waypoints()          # collect + upload + two-step fly
-        elif name.startswith("mission 1"):
-            client.mission_1_flow(mid)          # prepare + two-step fly (hover+detect)
-        elif name.startswith("mission 2"):
-            client.mission_2_flow(mid)          # prepare + two-step fly (follow-me)
-        else:
-            client.run_mission(mid)             # motor tests etc.
+        name = item.get("name", "").lower()
+        try:
+            if name.startswith("fly to waypoints"):
+                client.upload_waypoints()       # collect + upload + two-step fly
+            elif name.startswith("mission 1"):
+                client.mission_1_flow(mid)      # prepare + two-step fly (hover+detect)
+            elif name.startswith("mission 2"):
+                client.mission_2_flow(mid)      # prepare + two-step fly (follow-me)
+            else:
+                client.run_mission(mid)         # motor tests, props toggle, etc.
+        except KeyboardInterrupt:
+            print(f"\n{C_WARN}Cancelled — back to the menu.{C_OFF}")
+        except Exception as exc:
+            # Never let one bad exchange end the session while you're in the field.
+            print(f"{C_ERR}Command failed: {exc}{C_OFF}")
+            print(f"{C_DIM}(still connected — pick another option, or 'r' to refresh){C_OFF}")
+        # The props toggle changes the menu labels, so refresh after it
+        if "toggle props" in name:
+            fresh = client.get_menu()
+            if fresh:
+                items = fresh
 
 
 def main():
