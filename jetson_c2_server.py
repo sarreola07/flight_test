@@ -135,6 +135,10 @@ class MockFC:
     def send_velocity(self, vx, vy, vz, yaw_rate):
         self._last_vel = (vx, vy, vz, yaw_rate)   # recorded for tests
 
+    def set_takeoff_alt(self, alt_m):
+        self._takeoff_alt = alt_m
+        return True
+
     def flight_state(self):
         now = time.time()
         # AUTO.MISSION completes on its own ~4 s after takeoff (mock). TAKEOFF/HOLD
@@ -163,6 +167,11 @@ class RealFC:
 
     def __init__(self, device, baud):
         self.master = missions.connect(device, baud)
+        # Cached flight state. _armed starts False but is set True by arm(), so a
+        # mission loop can never mistake "no telemetry yet" for "already landed".
+        self._armed = False
+        self._alt = 0.0
+        self._mode = "?"
 
     def status(self):
         armed = False
@@ -200,6 +209,7 @@ class RealFC:
         while time.time() < end:
             hb = self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
             if hb and (hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
+                self._armed = True      # seed the cache before the flight loop runs
                 return True
         return False
 
@@ -226,15 +236,32 @@ class RealFC:
             0, 0, 0,            # acceleration (ignored)
             0, yaw_rate)        # yaw (ignored), yaw_rate
 
+    def set_takeoff_alt(self, alt_m):
+        """Tell PX4 what altitude AUTO.TAKEOFF should climb to."""
+        self.master.mav.param_set_send(
+            self.master.target_system, self.master.target_component,
+            b"MIS_TAKEOFF_ALT", float(alt_m),
+            mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+        ack = self.master.recv_match(type="PARAM_VALUE", blocking=True, timeout=3)
+        return bool(ack)
+
     def flight_state(self):
-        hb = self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=2)
-        armed = bool(hb and (hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED))
-        mode = mavutil.mode_string_v10(hb) if hb else "?"
-        alt = 0.0
-        g = self.master.recv_match(type="GLOBAL_POSITION_INT", blocking=False)
-        if g:
-            alt = round(g.relative_alt / 1000.0, 2)
-        return {"armed": armed, "alt": alt, "mode": mode}
+        """Latest armed/alt/mode. NON-blocking: the flight loop must stay
+        responsive so abort and link-loss are detected promptly (and so OFFBOARD
+        setpoints keep streaming above PX4's 2 Hz minimum)."""
+        while True:
+            msg = self.master.recv_match(
+                type=["HEARTBEAT", "GLOBAL_POSITION_INT"], blocking=False)
+            if msg is None:
+                break
+            if msg.get_type() == "HEARTBEAT":
+                self._armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                self._mode = mavutil.mode_string_v10(msg)
+            else:
+                self._alt = round(msg.relative_alt / 1000.0, 2)
+        return {"armed": getattr(self, "_armed", False),
+                "alt": getattr(self, "_alt", 0.0),
+                "mode": getattr(self, "_mode", "?")}
 
     def run_mission(self, mid, motors=6):
         if mid == 1:
@@ -397,10 +424,13 @@ class C2Server:
         if t == p.GET_MENU:
             # Stream the menu one item per packet — a full menu in a single packet
             # exceeds the LoRa limit (~255 B) and the firmware's 240-byte buffer.
-            # Each item (with its props/GPS flags) fits comfortably.
+            # Strip server-internal keys ("fly"/"action") to keep each packet
+            # small: less airtime per item means less chance of link corruption.
             items = self.menu()
-            return [p.message(p.MENU, seq, item=it, last=(i == len(items) - 1))
-                    for i, it in enumerate(items)]
+            wire = [{k: v for k, v in it.items() if k not in ("fly", "action")}
+                    for it in items]
+            return [p.message(p.MENU, seq, item=it, last=(i == len(wire) - 1))
+                    for i, it in enumerate(wire)]
         if t == p.PING:
             return [p.message(p.PONG, seq)]
         if t == p.WP_BEGIN:
@@ -518,6 +548,9 @@ class C2Server:
                 send(p.message(p.DONE, 0, id="mission1", result="FAILED: arm rejected"))
                 return
             send(p.message(p.LOG, 0, text="armed — takeoff to {:g} m".format(HOVER_ALT_M)))
+            # AUTO.TAKEOFF climbs to MIS_TAKEOFF_ALT, so set it or PX4 uses its
+            # own default height instead of the one this mission intends.
+            self.fc.set_takeoff_alt(HOVER_ALT_M)
             self.fc.set_flight_mode("TAKEOFF")
         except Exception as exc:
             send(p.message(p.DONE, 0, id="mission1", result=f"FAILED: {exc}"))
@@ -623,6 +656,9 @@ class C2Server:
                 send(p.message(p.DONE, 0, id="mission2", result="FAILED: arm rejected"))
                 return
             send(p.message(p.LOG, 0, text="armed — takeoff to {:g} m".format(HOVER_ALT_M)))
+            # AUTO.TAKEOFF climbs to MIS_TAKEOFF_ALT, so set it or PX4 uses its
+            # own default height instead of the one this mission intends.
+            self.fc.set_takeoff_alt(HOVER_ALT_M)
             self.fc.set_flight_mode("TAKEOFF")
         except Exception as exc:
             send(p.message(p.DONE, 0, id="mission2", result=f"FAILED: {exc}"))
@@ -765,14 +801,26 @@ class C2Server:
 # LoRa serial transport (transparent line bridge on the other end).
 # --------------------------------------------------------------------------
 class LoRaLink:
+    # The Heltec firmware is half-duplex: one packet is on the air for ~200 ms at
+    # SF7, while its UART buffer is only ~256 B. Writing several packets back to
+    # back overflows that buffer and silently corrupts messages, so every send is
+    # paced to give the radio time to drain.
+    MIN_SEND_GAP_S = 0.30
+
     def __init__(self, port, baud):
         import serial
         # exclusive=True so nothing else can grab the LoRa port and corrupt the link
         self.ser = serial.Serial(port, baud, timeout=0.2, exclusive=True)
         self._buf = ""
+        self._last_send = 0.0
 
     def send(self, msg):
+        gap = self.MIN_SEND_GAP_S - (time.time() - self._last_send)
+        if gap > 0:
+            time.sleep(gap)
         self.ser.write(p.encode(msg).encode("utf-8"))
+        self.ser.flush()
+        self._last_send = time.time()
 
     def poll(self):
         try:
