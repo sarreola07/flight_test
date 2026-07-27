@@ -16,14 +16,11 @@ PY="/home/jetson/Desktop/pixhawk-test/venv/bin/python"
 
 case "${1:-status}" in
   on)
+    # Props ON is the server default now, so this just clears any bench override.
     echo "==> Switching to FLIGHT mode (props ON)..."
     echo "    Motor tests will be locked out; Mission 1/2/waypoints allowed."
-    sudo mkdir -p "${DROPIN_DIR}"
-    sudo tee "${DROPIN}" >/dev/null <<EOF
-[Service]
-ExecStart=
-ExecStart=${PY} ${SERVER} --real --props-on
-EOF
+    sudo rm -f "${DROPIN}"
+    sudo rmdir "${DROPIN_DIR}" 2>/dev/null || true
     sudo systemctl daemon-reload
     sudo systemctl restart "${SVC}"
     sleep 3
@@ -32,8 +29,12 @@ EOF
     ;;
   off)
     echo "==> Switching to BENCH mode (props OFF)..."
-    sudo rm -f "${DROPIN}"
-    sudo rmdir "${DROPIN_DIR}" 2>/dev/null || true
+    sudo mkdir -p "${DROPIN_DIR}"
+    sudo tee "${DROPIN}" >/dev/null <<EOF
+[Service]
+ExecStart=
+ExecStart=${PY} ${SERVER} --real --props-off
+EOF
     sudo systemctl daemon-reload
     sudo systemctl restart "${SVC}"
     sleep 3
@@ -42,9 +43,9 @@ EOF
     ;;
   status)
     if [[ -f "${DROPIN}" ]]; then
-      echo "Service mode: FLIGHT (props ON) — flight missions allowed"
-    else
       echo "Service mode: BENCH (props OFF) — motor tests allowed, flight blocked"
+    else
+      echo "Service mode: FLIGHT (props ON, default) — flight missions allowed"
     fi
     systemctl is-active "${SVC}"
     ;;

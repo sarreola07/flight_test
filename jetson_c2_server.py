@@ -348,7 +348,7 @@ class RealFC:
 # The C2 server: protocol handling + mission dispatch.
 # --------------------------------------------------------------------------
 class C2Server:
-    def __init__(self, fc, props_off=True, motors=6, log=print):
+    def __init__(self, fc, props_off=False, motors=6, log=print):
         self.fc = fc
         self.props_off = props_off
         self.motors = motors
@@ -366,6 +366,10 @@ class C2Server:
              "gps": True, "fly": "mission1"},
             {"id": 5, "name": "Mission 2: follow person", "needs": "props_on",
              "gps": True, "fly": "mission2"},
+            # Runtime props toggle so the state is never a hardcoded flag the
+            # operator can't reach from the field (LoRa menu = numbers only).
+            {"id": 6, "name": "Toggle props state (now {})".format(
+                "OFF" if self.props_off else "ON"), "action": "toggle_props"},
         ]
 
     def _validate(self, mid):
@@ -429,6 +433,20 @@ class C2Server:
         *prepared* and wait for a CONFIRM (two-step arm)."""
         seq = msg.get("seq", 0)
         mid = msg.get("id")
+
+        # Runtime actions (no props/GPS gate) — handled before validation.
+        item0 = next((i for i in self.menu() if i["id"] == mid), {})
+        if item0.get("action") == "toggle_props":
+            self.props_off = not self.props_off
+            state = "OFF" if self.props_off else "ON"
+            self.log(f"props state toggled -> {state}")
+            send(p.message(p.ACK, seq, id=mid, accepted=True,
+                           reason=f"props now {state}"))
+            send(p.message(p.DONE, seq, id=mid,
+                           result=f"props now {state} — "
+                                  f"{'motor tests' if self.props_off else 'flight missions'} enabled"))
+            return
+
         accepted, reason = self._validate(mid)
         if not accepted:
             send(p.message(p.ACK, seq, id=mid, accepted=False, reason=reason))
@@ -848,8 +866,14 @@ def main():
     ap.add_argument("--motors", type=int, default=6)
     ap.add_argument("--real", action="store_true",
                     help="connect the real Pixhawk (default is a safe mock FC)")
+    # Props are ON by default: once the aircraft is in flight testing they stay
+    # fitted, and the operator can't edit flags from the field. Motor tests are
+    # then blocked (correct — never spin props by hand); flip state at runtime
+    # from the laptop with the "Toggle props" menu item, or start with --props-off.
+    ap.add_argument("--props-off", action="store_true",
+                    help="declare props OFF (enables motor tests, blocks flight)")
     ap.add_argument("--props-on", action="store_true",
-                    help="declare props ON (enables flight missions, disables motor tests)")
+                    help="(default) declare props ON — kept for compatibility")
     args = ap.parse_args()
 
     # Line-buffer stdout so logs reach the journal immediately under systemd.
@@ -874,7 +898,7 @@ def main():
     else:
         fc = MockFC()
 
-    server = C2Server(fc, props_off=not args.props_on, motors=args.motors)
+    server = C2Server(fc, props_off=args.props_off, motors=args.motors)
 
     try:
         serve(server, link)
